@@ -1,0 +1,10 @@
+import { Router } from 'express';
+import { connectWhatsApp, disconnectWhatsApp, getWhatsAppQr, getWhatsAppStatus, resetWhatsAppSession } from '../services/whatsapp.service.js';
+const router = Router();
+const requireSetupToken = (req, res, next) => { if (!process.env.WHATSAPP_SETUP_TOKEN || req.get('x-whatsapp-setup-token') === process.env.WHATSAPP_SETUP_TOKEN) return next(); return res.status(401).json({ error: { message: 'Invalid WhatsApp setup token.' } }); };
+router.get('/status', async (req, res) => res.json(await getWhatsAppStatus()));
+router.post('/connect', requireSetupToken, async (req, res, next) => { try { await connectWhatsApp(); res.status(202).json(await getWhatsAppStatus()); } catch (error) { next(error); } });
+router.get('/qr', requireSetupToken, (req, res) => { const qr = getWhatsAppQr(); if (!qr) return res.status(404).json({ error: { message: 'No QR code is currently available. WhatsApp is managed by the Hermes gateway.' } }); res.json({ qr }); });
+router.post('/disconnect', requireSetupToken, async (req, res, next) => { try { await disconnectWhatsApp(); res.json(await getWhatsAppStatus()); } catch (error) { next(error); } });
+router.post('/reset-session', requireSetupToken, async (req, res, next) => { try { await resetWhatsAppSession(); res.status(204).end(); } catch (error) { next(error); } });
+export default router;

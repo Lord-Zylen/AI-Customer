@@ -1,0 +1,2 @@
+const base=import.meta.env.VITE_API_URL||'/api';
+export async function api(path,options={}){const token=sessionStorage.getItem('customer_ai_token');const response=await fetch(`${base}${path}`,{headers:{'Content-Type':'application/json',...(token?{Authorization:`Bearer ${token}`}:{}) ,...(options.headers||{})},...options});if(!response.ok){const body=await response.json().catch(()=>({}));throw new Error(body.error?.message||'Request failed.')}return response.status===204?null:response.json();}

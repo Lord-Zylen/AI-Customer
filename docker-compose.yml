@@ -1,0 +1,28 @@
+services:
+  customer-ai:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MONGODB_URI: mongodb://mongodb:27017/customer_ai
+      WHATSAPP_AUTH_DIR: /app/data/whatsapp-auth
+    ports:
+      - "5000:5000"
+    volumes:
+      - whatsapp_auth:/app/data/whatsapp-auth
+    depends_on:
+      mongodb:
+        condition: service_healthy
+  mongodb:
+    image: mongo:8
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  mongo_data:
+  whatsapp_auth:

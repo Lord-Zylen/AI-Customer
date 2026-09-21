@@ -1,0 +1,2 @@
+import mongoose from 'mongoose';
+export default mongoose.model('BusinessSettings',new mongoose.Schema({businessName:{type:String,default:''},description:{type:String,default:''},location:{type:String,default:''},openingHours:{type:String,default:''},productsServices:{type:String,default:''},prices:{type:String,default:''},deliveryInformation:{type:String,default:''},paymentInformation:{type:String,default:''},commonQuestions:{type:String,default:''}},{timestamps:true}));

@@ -1,0 +1,2 @@
+import mongoose from 'mongoose';
+export default mongoose.model('Conversation',new mongoose.Schema({customerId:{type:mongoose.Schema.Types.ObjectId,ref:'Customer',required:true,index:true},channel:{type:String,default:'WHATSAPP'},status:{type:String,enum:['OPEN','HUMAN_REQUIRED','RESOLVED'],default:'OPEN',index:true},aiEnabled:{type:Boolean,default:true},requiresHuman:{type:Boolean,default:false},assignedTo:{type:mongoose.Schema.Types.ObjectId,ref:'User'},lastMessageAt:{type:Date,default:Date.now,index:true}},{timestamps:true}));
