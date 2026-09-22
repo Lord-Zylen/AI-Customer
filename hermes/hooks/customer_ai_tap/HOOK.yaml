@@ -1,0 +1,5 @@
+name: customer_ai_tap
+description: Mirror WhatsApp conversation turns from the Hermes gateway into the Customer AI supervision app.
+events:
+  - agent:start
+  - agent:end

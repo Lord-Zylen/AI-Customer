@@ -1,3 +1,6 @@
+# VPS-ONLY deployment template. NOT used by Blitz Cloud (Blitz Cloud uses the
+# root Dockerfile + deploy/blitz/* container supervisor). See README
+# "Blitz Cloud Deployment" for the primary target.
 [Unit]
 Description=Hermes Agent Gateway - Messaging Platform Integration
 After=network-online.target
