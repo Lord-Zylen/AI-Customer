@@ -8,26 +8,124 @@ Customer AI is a WhatsApp customer service workspace. Hermes triages messages, r
 2. Run `npm run install:all`.
 3. Run `npm run dev` and open `http://localhost:5173`.
 
-The frontend is a WhatsApp inbox with a human-review queue, business settings that feed Hermes, a WhatsApp pairing screen, and a system-status page. The Express server exposes `/api/health`, the Hermes webhooks (`/api/hermes/webhook/gate`, `/api/hermes/webhook/event`, `/api/hermes/webhook/knowledge`), and the WhatsApp conversation APIs.
+The frontend is a WhatsApp inbox with a human-review queue, business settings that feed Hermes, a WhatsApp pairing screen, and a system-status page. The Express server exposes `/api/health`, the Hermes webhooks (`/api/hermes/webhook/gate`, `/api/hermes/webhook/event`, `/api/hermes/webhook/knowledge`), and the WhatsApp conversation and human-queue APIs. In local development the backend binds `127.0.0.1:5000` by default (`HOST`, `PORT`).
 
 ## Integration boundaries
 
-WhatsApp is owned by the Hermes gateway (single connection). Hermes calls Customer AI's `pre_gateway_dispatch` plugin and mirror hooks (`~/.hermes/plugins/customer-ai-gate`, `~/.hermes/hooks/customer_ai_tap`), which POST to `/api/hermes/webhook/*`. Human replies from the dashboard are sent through the `hermes send` CLI via `server/src/services/whatsapp.service.js`.
+WhatsApp is owned by the Hermes gateway (single connection). Hermes calls Customer AI's `pre_gateway_dispatch` plugin and mirror hooks (`~/.hermes/plugins/customer-ai-gate`, `~/.hermes/hooks/customer_ai_tap`), which POST to `/api/hermes/webhook/*`. Human replies from the dashboard are sent through the `hermes send` CLI via `server/src/services/whatsapp.service.js` (`HERMES_BIN`). Customer AI never opens its own WhatsApp connection.
 
-## Production deployment
+```
+WhatsApp → Hermes bridge → customer-ai-gate → POST /api/hermes/webhook/gate
+             → decideInbound() → allow/skip → Hermes agent → WhatsApp transport
+             → customer_ai_tap → POST /api/hermes/webhook/event
+Human queue reply → POST /api/conversations/:id/messages → `hermes send --to whatsapp:<jid>`
+```
 
-Target architecture (supported, native — no Docker required):
+## Blitz Cloud Deployment
 
-- **Vercel** serves `/client` (Vite React) with `VITE_API_URL` pointing at the VPS API.
-- **VPS** runs the Node backend (`server/`, `node src/server.js`) behind Nginx (HTTPS) + the Hermes gateway as a systemd service. Hermes owns the WhatsApp session in its persistent `~/.hermes` directory; the bridge is spawned by the gateway.
-- **MongoDB Atlas** stays external (`MONGODB_URI`).
+Blitz Cloud is the **primary** deployment target. The frontend is served by Vercel; a single Blitz Cloud container runs the Node backend **plus** the Hermes gateway **plus** the WhatsApp bridge; MongoDB stays on Atlas.
 
-Read `customer-ai-debug-report.txt` for the full runbook. Deployment templates:
+### A. Architecture
 
-- `client/vercel.json` — Vercel SPA routing; deploy with build `npm run build`, output `dist`.
-- `deploy/systemd/customer-ai.service` — backend service.
-- `deploy/systemd/hermes-gateway.service` — Hermes gateway service (spawns the WhatsApp bridge).
-- `deploy/nginx/customer-ai.conf` — reverse proxy template (`https://api.example.com` → `127.0.0.1:5000`).
-- `.env.example` — full production environment reference.
+```
+            ┌──────────────┐
+            │    Vercel    │   React frontend (client/)
+            └──────┬───────┘
+                   │ HTTPS
+                   ▼
+      ┌───────────────────────────┐
+      │      Blitz Cloud          │  one container (port 8080)
+      │  Customer AI (Node)       │
+      │     ├ Hermes Gateway      │
+      │     │   └ WhatsApp bridge │
+      │     └ MongoDB client      │
+      └─────────────┬─────────────┘
+                    ▼
+          MongoDB Atlas (external)
+```
 
-WhatsApp pairing happens **after** the VPS and Nginx are working, and only on the VPS's persistent Hermes directory. Never reset or copy the local session during deployment.
+Hermes remains the **only** WhatsApp transport owner. Customer AI and Hermes must share the same container because the human-queue send path invokes the local Hermes CLI (`hermes send`).
+
+### B. Repository configuration
+
+Deploy the **repository root** to Blitz Cloud with **Dockerfile** build (root `Dockerfile`). Vercel deploys **only `client/`**.
+
+- Blitz build: root `Dockerfile` → runs `/opt/customer-ai/entrypoint.sh` → Node process supervisor (`deploy/blitz/supervisor.mjs`) starts the backend, waits for `/api/health`, then starts the Hermes gateway (which spawns the WhatsApp bridge).
+- The container runs as the non-root user `customerai` with **`uid 1000` / `gid 1000`** — Blitz Cloud runs every container as `--user 1000:1000` and Linux capabilities are dropped, so the image must start and run **without root** (no sudo, no runtime `chown`, no setuid, no privileged capabilities). The image targets **linux/amd64**. No systemd, no Nginx, no root, no local MongoDB.
+
+### C. Environment variables
+
+Set these in the **Blitz Cloud** application environment (names only — set real values in Blitz, never in git):
+
+- Backend: `NODE_ENV`, `HOST`, `PORT`, `TRUST_PROXY`, `MONGODB_URI`, `SESSION_SECRET`, `AI_API_KEY`, `AI_MODEL`, `AI_CONFIDENCE_THRESHOLD`, `HERMES_ENABLED`, `HERMES_HOME`, `HERMES_GATEWAY_STATE`, `HERMES_BIN`, `HERMES_STATE_STALE_MS`, `CAI_HOOK_SECRET`, `CAI_HOOK_BASE_URL`, `CLIENT_ORIGIN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `SEED_PRINT_CREDENTIALS`, `WHATSAPP_SETUP_TOKEN`
+- Hermes (same container): `GROQ_API_KEY`, `WHATSAPP_ENABLED`, `WHATSAPP_ALLOW_ALL_USERS`, `WHATSAPP_ALLOWED_USERS`, `WHATSAPP_HOME_CHANNEL`
+
+See `.env.example` for a commented template.
+
+### D. Port
+
+The container listens on **`8080`** (`PORT=8080`, `HOST=0.0.0.0`). Blitz routes public HTTPS to it. Do not bind `127.0.0.1` in production — Blitz needs to reach the container over its network.
+
+### E. Persistent storage
+
+**`/home/customerai/.hermes` MUST be backed by Blitz persistent storage.** It holds the Hermes/WhatsApp session, Hermes databases, logs and config. Losing this directory can require WhatsApp re-pairing. Attach a persistent volume/mount to that path in Blitz (attach the persistent directory to `/home/customerai/.hermes`). The image declares `VOLUME ["/home/customerai/.hermes"]` and ships an empty production Hermes home (the local developer's `~/.hermes` is never copied in). Configuration and plugin/hook seeds are written there automatically on first boot. Note: persistent folders are **not backed up by Blitz** — treat the persistent volume as the single non-redundant source of truth for the WhatsApp session, and export/copy it yourself if you need redundancy.
+
+### F. Initial WhatsApp pairing
+
+First deployment needs one interactive pairing of the WhatsApp account.
+
+- The container's `~/.hermes` config, session and pairing directories support persistent Hermes authentication; after pairing, normal restarts do **not** require another QR scan (the pair persists in the volume).
+- Hermes provides its official pairing flow via the `hermes` CLI (which the container resolves to `python -m hermes_cli.main gateway run` / `hermes gateway`). Completed pairing data is stored under `$HERMES_HOME`.
+- `UNVERIFIED — initial Hermes WhatsApp pairing method on Blitz Cloud`: it is **not** yet known whether/how the one-time QR/link pairing can be performed on Blitz (this depends on whether Blitz exposes an interactive container shell, which is itself UNVERIFIED). **If no shell exists**: build the paired session inside a scratch container running the same image as uid 1000, then seed its `~/.hermes` contents into the Blitz persistent volume; the session format is the standard Hermes/Baileys one, so a session produced by the same Hermes version is compatible.
+- Never expose the QR via an unauthenticated HTTP endpoint. The Customer AI `/api/whatsapp/*` pairing routes remain `409 "managed by Hermes"` and are **not** used for pairing. Never copy the developer's real local WhatsApp session into the image/volume for production.
+
+### G. Vercel
+
+- Root directory: `client`
+- Build command: `npm run build`
+- Output directory: `dist`
+- Environment: `VITE_API_URL=https://<blitz-public-domain>/api`
+- `client/vercel.json` keeps the SPA rewrite working.
+- No serverless functions; frontend only.
+
+### H. MongoDB Atlas
+
+MongoDB is **external**. Blitz only runs the application container (no mongod inside). Set `MONGODB_URI` to the Atlas connection string with network access allowed for the Blitz Cloud egress IP(s).
+
+### I. CORS
+
+Set `CLIENT_ORIGIN=https://<vercel-domain>` (comma-separated list if more than one origin). No-Origin requests (internal Hermes→Customer AI webhooks over `http://127.0.0.1:8080`) keep working.
+
+### J. Secrets
+
+Configure these in Blitz and never commit them: `MONGODB_URI`, `SESSION_SECRET`, `AI_API_KEY`, `CAI_HOOK_SECRET`, `GROQ_API_KEY`, `WHATSAPP_SETUP_TOKEN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`. CAI_HOOK_SECRET must be identical for the backend and Hermes (same container environment).
+
+### K. Health check
+
+Use `GET /api/health`. It reports DB health and is **independent of WhatsApp connection state** — a healthy backend with WhatsApp temporarily disconnected still reports healthy. The image also ships a Docker `HEALTHCHECK` against `/api/health`. Because the endpoint is DB-backed, a **reachable `MONGODB_URI` is required** for it to return `200`; without it the supervisor's readiness poll times out and the container exits 1 (correct fail-fast). The operator's backend-only smoke test (`HERMES_ENABLED=false`) therefore also needs `-e MONGODB_URI=<atlas-uri>`.
+
+### L. Logs / troubleshooting
+
+- Container logs show prefixed `[backend]`, `[hermes]`, and `[supervisor]` lines (startup, health, termination, failures). Secrets and message contents are never logged.
+- `HERMES_STATE_STALE_MS`/gateway liveness: the dashboard trusts the gateway state file plus live-PID checks; a healthy idle gateway is **not** reported disconnected.
+- If `/api/health` stays 503: check `MONGODB_URI` and Atlas network access.
+- If the gate logs `gate returned HTTP ...; message not admitted (fail closed)`: check `CAI_HOOK_SECRET`/`CAI_HOOK_BASE_URL` — messages are deliberately dropped until the hook works.
+- If no WhatsApp replies arrive: check Blitz persistent storage is mounted at `/home/customerai/.hermes` and whether pairing re-happened (see F).
+
+### Blitz-specific assumptions (UNVERIFIED)
+
+The Dockerfile uses standard Docker primitives — `EXPOSE 8080`, `HEALTHCHECK` on `/api/health`, `VOLUME ["/home/customerai/.hermes"]`, non-root uid/gid 1000. Public documentation for the configured Blitz Cloud platform was not available at preparation time, so the following **require manual confirmation in the Blitz Cloud console/dashboard**:
+
+- Blitz runs the container as **UID/GID 1000**; the image is designed to start **without root** (this is what the Dockerfile enforces, and it must be re-confirmed on the actual Blitz runtime).
+- The image must support the **linux/amd64** platform.
+- Port **8080** is used by the container.
+- `/home/customerai/.hermes` is declared persistent; persistent folders are **not backed up by Blitz**.
+- **No Nginx is required** and **no systemd is required** (the container internally supervises its own processes; `deploy/systemd` and `deploy/nginx` are VPS-only, legacy).
+- `UNVERIFIED — requires manual confirmation in Blitz Cloud`: that Blitz routes public HTTPS to the container's `8080` port.
+- `UNVERIFIED — requires manual confirmation in Blitz Cloud`: the exact way to attach persistent storage and that it can be mounted at `/home/customerai/.hermes` with `uid 1000` (`customerai`) ownership/writability.
+- `UNVERIFIED — requires manual confirmation in Blitz Cloud`: whether Blitz adopts the Docker `HEALTHCHECK` (if not, configure `/api/health` as the health check manually).
+- `UNVERIFIED — initial Hermes WhatsApp pairing method on Blitz Cloud` (see F).
+
+## Legacy VPS deployment (optional)
+
+The repository also contains a traditional single-VPS deployment (systemd + Nginx) under `deploy/systemd/` and `deploy/nginx/`. **These are VPS-only and are NOT used by Blitz Cloud.** Keep the two deployment methods separate: if you use Blitz, ignore `deploy/systemd` and `deploy/nginx`. The `docker-compose.yml` (bundled local Mongo + Baileys-era auth volume) is also legacy and not part of the Blitz layout.

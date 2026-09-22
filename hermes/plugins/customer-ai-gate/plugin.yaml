@@ -1,0 +1,16 @@
+name: customer-ai-gate
+version: 0.1.0
+description: "Customer AI integration. Gates every inbound WhatsApp message through the Customer AI decision webhook (allow/skip): approved messages are admitted into the Hermes agent for a single automatic reply; skipped messages stay silent for the human queue. Also injects the approved business knowledge (from Customer AI) into the agent prompt so automatic replies never invent prices, stock, delivery fees, refunds, or policies."
+author: Customer AI
+kind: standalone
+platforms:
+  - linux
+  - darwin
+hooks:
+  - pre_gateway_dispatch
+provides_hooks:
+  - pre_gateway_dispatch
+tags:
+  - customer-service
+  - whatsapp
+  - supervision

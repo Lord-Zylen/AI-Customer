@@ -1,0 +1,47 @@
+# Runtime / dependency artifacts
+node_modules
+server/node_modules
+client/node_modules
+hermes-agent/node_modules
+
+# VCS and CI
+.git
+.gitignore
+.github
+
+# Secrets — never copied into the image.
+.env
+.env.*
+!.env.example
+!client/.env.example
+**/.env
+**/.env.local
+
+# Build output (the Dockerfile rebuilds the client itself)
+dist
+client/dist
+server/dist
+
+# Local caches / logs
+coverage
+logs
+*.log
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+*.pyc
+
+# Local data — NEVER ship a local Hermes/WhatsApp/etc. session into the image.
+# The production session is created inside persistent Blitz storage.
+data
+whatsapp-session
+creds.json
+**/session
+*.db
+*.db-shm
+*.db-wal
+
+# Local-only environment/dotfiles
+.hermes_history
+.install_id*
+install_id

@@ -1,166 +1,321 @@
 ===============================================================================
-Customer AI <-> Hermes <-> WhatsApp — LATEST UPDATE (2026-09-22)
+Customer AI <-> Hermes <-> WhatsApp — FINAL STATIC AUDIT / BLITZ READINESS
 ===============================================================================
-  This file is the single current update only; prior update content was
-  deleted. Baseline facts it replaces (previously verified): human-queue
-  assignment (Fix 1), Groq title reasoning_effort=low (Fix 2), rate limit
-  240/min (Fix 8), prod-seed credential safety (Fix 4), agent:end recording
-  edge cases (Fix 5), plugin non-200 WARNING (Fix 6), 409 managed-by-Hermes
-  contract (Fix 7), and the gateway-staleness handling now superseded by the
-  PID-liveness model below.
+Mode: static audit only. Nothing deployed, pushed, SSH'd, paired, or messaged.
+Local WhatsApp session and ~/.hermes were READ-ONLY during this audit. This is
+the single current report (previous reports replaced per the operator rule).
 
-SCOPE OF THIS UPDATE
-  Production deployment preparation — repo-side and verified locally only.
-  Nothing was deployed, pushed, SSH'd, paired, or messaged. Local WhatsApp
-  session untouched.
+===============================================================================
+1. CURRENT STATUS
+===============================================================================
+Repository is in a clean, deployment-ready static state for Blitz Cloud:
+Dockerfile (uid/gid 1000, port 8080, empty VOLUME at /home/customerai/.hermes,
+non-root, no Nginx/systemd), entrypoint + Node supervisor, seeded sanitized
+Hermes config/plugin/hook, backend + Hermes + bridge all wired to one container,
+Vercel frontend only. Docker build/run could NOT be executed (no daemon access),
+so everything that requires the container is explicitly UNVERIFIED.
 
-A — TARGET ARCHITECTURE
-  Vercel       : React frontend (PUSH client/ only). SPA; no serverless funcs.
-  VPS          : Customer AI Node backend + Hermes gateway (+ WhatsApp bridge
-                 child) + Nginx TLS. Native systemd; Docker optional legacy.
-  MongoDB      : Atlas, external (MONGODB_URI), no local mongod dependency.
+===============================================================================
+2. CHANGES MADE (this audit; all minimal, no refactors)
+===============================================================================
+- Dockerfile: added note that /api/health is DB-backed, so the backend-only
+  smoke run needs -e MONGODB_URI=<atlas-uri> (without it the health check 503s
+  and the supervisor exits after the wait — correct fail-fast, now documented).
+- README section K: documented the same MONGODB_URI requirement for /api/health.
+- hermes/: removed __pycache__ / *.pyc artifacts created by this audit's
+  py_compile run (git hygiene). No source changes.
+No application, gate, WhatsApp-ownership, or frontend behavior changed.
 
-B — FILES CHANGED (this round)
-  server/src/server.js
-      + binds HOST (env, default 127.0.0.1) — Node never exposed on a public
-        port; Nginx terminates TLS to 127.0.0.1:5000 (HOST=0.0.0.0 only if a
-        container needs it).
-      + CORS allowlist from CLIENT_ORIGIN as a comma-separated list, e.g.
-        'https://customer-ai.vercel.app,http://localhost:5173'. Disallowed
-        origins are NOT reflected (no ACAO -> browser blocks). Requests with
-        no Origin (Hermes webhooks, curl) still pass.
-      + app.set('trust proxy', 1) so the /api 240/min rate limit keys on the
-        REAL client IP behind Nginx (otherwise all users share the proxy's IP
-        and the aggregate limit misfires). Safe here because the backend
-        binds 127.0.0.1 and only Nginx can reach it.
+===============================================================================
+3. UID/GID VERIFICATION
+===============================================================================
+PASS (static) — Dockerfile renames the Node base image's built-in uid/gid-1000
+user (`node`) to `customerai`, moves HOME to /home/customerai, renames group to
+`customerai` (gid 1000 preserved), and a build-time assertion
+`test $(id -u customerai) -eq 1000 && test $(id -g customerai) -eq 1000` fails
+the build otherwise.
+PASS (static) — no remaining UID 10001 reference anywhere except the historical
+note in this report. `rg 10001` clean on Dockerfile/README/env/server/hermes.
+PASS (static) — no runtime sudo; no runtime chown (ownership fixed at build);
+no setuid/no-new-privileges dependency; container is designed for
+`--user 1000:1000 --cap-drop ALL --security-opt no-new-privileges`.
+UNVERIFIED — actual build/runtime under `--user 1000:1000` (no Docker daemon).
+USER, HOME=/home/customerai, group, and ownership are internally consistent
+(usermod/groupmod apply before any chown/COPY --chown; all paths then use
+customerai).
 
-  server/src/services/whatsapp.service.js
-      HERMES_HOME          (env) defaults to ~/.hermes        (already existed)
-      HERMES_GATEWAY_STATE (env) defaults to HERMES_HOME/gateway_state.json
-                            (already existed)
-      + HERMES_STATE_STALE_MS default 300000 (5 min) — an age SUSPICION only.
-      + PID-liveness fallback (replaces the earlier age-only rule): the
-        gateway only rewrites gateway_state.json on lifecycle transitions and
-        agent turn boundaries (the 30s heartbeat lives in the separate
-        state/gateway.heartbeat file), so an idle but healthy gateway's state
-        file legitimately ages. Age alone therefore caused false "stopped
-        reporting" alarms. Stale is now true only when:
-            updated_at older than STATE_STALE_MS
-            AND the recorded gateway PID is NOT alive
-            (or its /proc/<pid>/stat field-22 start-time fingerprint does not
-             match the recorded start_time — PID-reuse guard, the same model
-             Hermes itself uses).
-      + stale gateway -> DISCONNECTED with
-        ("The Hermes gateway stopped reporting status; check that it is running.").
-      + unreadable/missing file -> DISCONNECTED + generic
-        "WhatsApp status is unavailable right now." — never leaks filesystem
-        paths to the browser.
-      + exposes a "stale" boolean in the status payload.
+===============================================================================
+4. RUNTIME WRITE-PATH AUDIT
+===============================================================================
+PASS (static) — every runtime writable location resolves to owner uid 1000 or a
+world-writable tmp, none requires root:
+  /home/customerai/.hermes        HERMES_HOME — customerai-owned, VOLUME-backed,
+                                  created writable by the entrypoint before any
+                                  gateway/backend process starts; Hermes state
+                                  (config.yaml, gateway_state.json, gateway.pid/
+                                  .lock/.sock, state/gateway.heartbeat,
+                                  channel_directory.json, cron/, kanban/, cache/,
+                                  logs/, pending_messages/, platforms/whatsapp/
+                                  session, pairing/, backups/) all live here.
+                                  NEEDS PERSISTENCE.
+  /home/customerai/.local         customerai-owned (launcher + uv cache from
+                                  build). Runtime reads only; writable anyway.
+                                  No persistence needed.
+  /home/customerai/.local/bin     contains the `hermes` launcher (uid 1000 +x).
+  /opt/hermes-agent               customerai-owned (install tree, read-only-ish).
+                                  GATEWAY PYTHON venv + hermes package here;
+                                  bridge dir writable so whatsapp_common.py
+                                  resolve_whatsapp_bridge_dir() uses it in place
+                                  (the only runtime write here is its
+                                  .write_test touch; npm deps prebuilt at image
+                                  build, no runtime npm). No persistence needed
+                                  (session/caches live under ~/.hermes).
+  /opt/customer-ai               customerai-owned; config/plugin/hook SEED
+                                  templates read on first boot only. No writes.
+  /app                           customerai-owned; supervisor + client dist +
+                                  server src. Read-only at runtime.
+  /app/server/node_modules       root-owned (build-time `npm ci`); READ-ONLY at
+                                  runtime (server never writes there).
+  /tmp, /var/tmp                 world-writable (Node/Python temp).
+PASS (static) — bridge.js runtime writes are SESSION_DIR
+(-> HERMES_HOME/whatsapp/session) and caches under ~/.hermes; nothing else.
+PASS (static) — the bridge is resolved via resolved install tree path (writable
+check) and NODE is located from PATH (node 22 at /usr/local/bin). Session dir is
+passed explicitly as HERMES_HOME/whatsapp/session.
+NOTE — previous report wording claiming gateway state/logs/pending live under
+/opt/hermes-agent is CORRECTED: they are under $HERMES_HOME
+(/home/customerai/.hermes), confirmed against Hermes get_hermes_home().
 
-  client/.env.example        (NEW) VITE_API_URL build-time doc.
-  client/vercel.json         (NEW) SPA rewrite: all routes -> /index.html.
-  .env.example               Rewritten to match the actual production vars:
-                             backend (server) section + Hermes-side reference
-                             section + Vercel VITE_API_URL section.
-  deploy/systemd/customer-ai.service        (NEW) unit template.
-  deploy/systemd/hermes-gateway.service     (NEW) unit template (spawns the
-                             child bridge; replace <vps-user>).
-  deploy/nginx/customer-ai.conf             (NEW) TLS -> 127.0.0.1:5000
-                             template (replace api.example.com + cert paths).
-  README.md                  Deployment section rewritten: Vercel + VPS +
-                             Nginx + Atlas; removed stale PostgreSQL / Docker
-                             / Customer-AI-Baileys-QR instructions.
-  .gitignore                 Fixed so both .env.example files are trackable
-                             (added !client/.env.example; dropped the trailing
-                             redundant .env.example ignore rule).
+===============================================================================
+5. HERMES CLI AUDIT
+===============================================================================
+PASS (static) — the launcher file is created by the Dockerfile at
+/home/customerai/.local/bin/hermes: `exec /opt/hermes-agent/venv/bin/python
+/opt/hermes-agent/hermes "$@"` (mirrors the verified local launcher, but with
+container paths — no developer-machine absolute path, no /root).
+PASS (static) — shebang `#!/usr/bin/env bash` valid; bash present in
+node:22-bookworm-slim; venv python exists at /opt/hermes-agent/venv/bin/python
+(created by `uv venv` + `uv sync --extra all --locked`, the verified install
+path); the `hermes` entry script exists at the Hermes repo root (verified in the
+cloned tree at the pinned commit 4716ec0).
+PASS (static) — PATH includes /home/customerai/.local/bin and
+/opt/hermes-agent/venv/bin; backend HERMES_BIN default resolves (env set in
+Dockerfile + .env.example); executable by uid 1000 (file +x, owner customerai).
+PASS (static) — supervisor launches the gateway via the venv python directly
+(`python -m hermes_cli.main gateway run`), independent of the launcher.
+UNVERIFIED — in-container execution of `hermes send`/`gateway pair` and
+launcher invocation (needs a build).
 
-C — VERCEL (frontend)
-  Project Root Directory = client/
-  Build command = npm run build   |   Output directory = dist
-  Env: VITE_API_URL=https://api.example.com/api  (public, ends with /api)
-  client/vercel.json rewrites all paths to /index.html (SPA).
-  Verified: build with VITE_API_URL emits the URL into dist bundle; grep for
-  localhost:5000 / 127.0.0.1:5000 / ChangeMe123! / admin@customer-ai.test in
-  dist -> NONE (dev-only login autofill is tree-shaken from prod builds).
+===============================================================================
+6. HERMES CONFIG/PLUGIN/HOOK AUDIT
+===============================================================================
+PASS (static) — hermes/configuration/config.yaml is a SANITIZED template: no API
+keys, no passwords, no session, no real WhatsApp JID (operator JID excluded;
+placeholders `3247...@lid`/`<operator-chat>@lid` only), no developer-only paths.
+PASS (static) — security-critical keys match the verified live config:
+provider custom:groq, plugin customer-ai-gate, key_env GROQ_API_KEY,
+reasoning_effort medium, display.show_reasoning true with whatsapp
+show_reasoning false, delivery_ledger true, allow_all_users false,
+unauthorized_dm_behavior ignore, platforms.whatsapp.enabled true.
+PASS (static) — the repo plugin/hook files are byte-identical to the verified
+~/.hermes originals (diff -q).
+PASS (static) — WHATSAPP_HOME_CHANNEL env is honored by the gateway
+(gateway/config_env.py `_env_home_channel`, present at the pinned commit) and by
+the customer-ai-gate plugin (reads env first) — operator home bypass works
+without embedding the JID. CAI_HOOK_BASE_URL defaults to 127.0.0.1:5000 in the
+plugin/hook but the Dockerfile/entrypoint/env supply http://127.0.0.1:8080
+(container-local; both processes share the container).
+PASS (static) — Customer AI does NOT connect to WhatsApp/Baileys anywhere in
+server/src or client/src (grep baileys/@whiskeysockets: none). WhatsApp is owned
+solely by Hermes; Customer AI is the gate plus the hermes-send human queue.
+Architecture: Vercel -> Customer AI+Hermes+bridge container -> WhatsApp;
+MongoDB Atlas stays external (no mongod in image, no localhost DB assumption).
 
-D — VPS (backend + Hermes)
-  Ubuntu + Node 22 (Dockerfile base; local is 24). Repo at /opt/customer-ai,
-  backend exec dir /opt/customer-ai/server, config file /opt/customer-ai/.env
-  (chmod 600, owned by the service user).
-  Nginx: deploy/nginx/customer-ai.conf -> HTTPS api.example.com ->
-  127.0.0.1:5000; long proxy timeouts (300s) so AI-classify webhooks don't cut.
-  Hermes: persistent ~/.hermes (venv ~/.hermes/hermes-agent/venv, launcher
-  ~/.local/bin/hermes, gateway cmd `python -m hermes_cli.main gateway run`,
-  spawns the WhatsApp bridge as a child). Daemon via
-  deploy/systemd/hermes-gateway.service (system-level equivalent of the
-  existing local user unit; WorkingDirectory ~/.hermes, HERMES_HOME, persist).
-  Hermes config to preserve on the VPS (verbatim from the verified local
-  machine): allow_all_users:false, unauthorized_dm_behavior:ignore,
-  delivery_ledger:true, display.show_reasoning:true +
-  platforms.whatsapp.show_reasoning:false, agent.reasoning_effort:medium,
-  title-generator reasoning_effort:low (never none), provider groq key_env
-  GROQ_API_KEY, home_channel whatsapp, profile hermes-whatsapp.
+===============================================================================
+7. BLITZ NETWORK/PORT AUDIT
+===============================================================================
+PASS (static) — Dockerfile ENV HOST=0.0.0.0, PORT=8080; EXPOSE 8080.
+PASS (static) — server.js binds `app.listen(PORT||5000, HOST||'127.0.0.1')` —
+env-controlled; the 127.0.0.1/5000 defaults exist only for local dev. No other
+hard-coded bind/port in server source (grep: the only localhost:5000 is the Vite
+dev proxy, dev-only).
+PASS (static) — no Nginx dependency, no systemd dependency anywhere in the
+container path; supervisor assumes container PID-1 semantics (not supervisor/systemd).
+UNVERIFIED — actual ingress routing on the Blitz platform (see section 16).
 
-E — DNS
-  api.example.com  A/AAAA -> VPS public IP.
-  Vercel provides *.vercel.app automatically; no custom domain required.
+===============================================================================
+8. PERSISTENCE/VOLUME AUDIT
+===============================================================================
+PASS (static) — Dockerfile declares `VOLUME ["/home/customerai/.hermes"]`.
+PASS (static) — all Hermes runtime state that must survive restarts is under
+$HERMES_HOME (see section 4), confirmed against Hermes get_hermes_home() and the
+bridge's SESSION_DIR/IMAGE_CACHE_DIR defaults. No state is written outside that
+needs persistence.
+PASS (static) — the image ships an EMPTY Hermes home; .dockerignore excludes
+~/.hermes session data, `.env`/secrets, node_modules, dist, caches, *.db,
+creds.json, whatsapp-session, data/ — the local developer home cannot reach the
+image. No unnecessary VOLUME declarations added.
 
-F — VERIFICATION RUN LOCALLY (ALL PASS; rerun on the VPS after deploy)
-  1) (cd client && VITE_API_URL=https://api.example.com/api npm run build)
-     -> dist bundles the prod URL; no localhost strings; no demo creds.
-  2) node --check on every edited server file.
-  3) Throwaway :5199 (real code, project DB, real gateway_state.json):
-     /api/health -> healthy/connected; /api/system/status -> backend+hermes
-     CONNECTED, groq CONFIGURED; /api/hermes/status -> secretConfigured:true,
-     endpoints list; /api/conversations without JWT -> 401;
-     RateLimit-Policy: 240;w=60 headers present.
-  4) CORS: Origin https://customer-ai.vercel.app -> reflected; preflight OK;
-     Origin https://evil.example.com -> no ACAO (blocked); no-Origin webhook
-     style request -> passes.
-  5) Staleness matrix: A live-idle real gateway CONNECTED/stale:false;
-     B dead pid DISCONNECTED/stale:true; C recycled pid (start-time mismatch)
-     stale:true; fresh-file-from-dead-pid still DISCONNECTED; missing file no
-     crash. (PID 999999 for dead; real pid 38188 with tampered start_time.)
-  6) python3 -m py_compile on Hermes title_generator.py + customer-ai-gate.
+===============================================================================
+9. SUPERVISOR/ENTRYPOINT AUDIT
+===============================================================================
+PASS (static) — startup order: entrypoint seeds HERMES_HOME (config/plugin/hook,
+idempotent first-boot-only) and creates runtime dirs, then execs the Node
+supervisor as PID 1 -> backend -> poll /api/health (120s) -> Hermes gateway ->
+bridge (spawned by gateway). HERMES_ENABLED=false skips the gateway.
+PASS (static) — supervisor forwards SIGTERM/SIGINT/SIGHUP, shuts the gateway down
+first (session flush) then backend, kills lingerers after grace, and exits
+non-zero on unexpected child death (container restart). Nothing requires root.
+PASS (static) — working dirs/env are correct: backend cwd /app/server; gateway
+cwd /opt/hermes-agent with venv python; env inherited wholesale from the
+container (Dockerfile defaults + Blitz injected).
+UNVERIFIED — runtime behavior in-container (build required).
+NOTE — the documented backend-only smoke command additionally needs MONGODB_URI
+(this was the one doc gap found; now fixed in Dockerfile header + README K).
 
-G — AFTER DEPLOY ON THE VPS (operator; NOT performed here)
-  WhatsApp pairing happens ON THE VPS only, into ~/.hermes persistent session.
-  Do NOT copy or reuse the local WhatsApp session. Pair via the Hermes tooling
-  on the VPS; then confirm hermes gateway status shows connected and the
-  dashboard /api/system/status flips to whatsapp CONNECTED. First E2E: reply
-  to an inbound chat and confirm a Customer AI row appears.
+===============================================================================
+10. ENVIRONMENT VARIABLE AUDIT
+===============================================================================
+PASS (static) — .env.example separates:
+  A) Customer AI: NODE_ENV, HOST, PORT, TRUST_PROXY, MONGODB_URI, SESSION_SECRET,
+     AI_API_KEY, AI_MODEL, AI_CONFIDENCE_THRESHOLD, ADMIN_EMAIL, ADMIN_PASSWORD,
+     SEED_PRINT_CREDENTIALS
+  B) Hermes integration (server side): HERMES_ENABLED, HERMES_HOME,
+     HERMES_GATEWAY_STATE, HERMES_BIN, HERMES_STATE_STALE_MS, CAI_HOOK_SECRET,
+     CAI_HOOK_BASE_URL
+  C) WhatsApp (via Hermes env): WHATSAPP_ENABLED, WHATSAPP_ALLOWED_USERS,
+     WHATSAPP_ALLOW_ALL_USERS (consumed by gateway run.py startup safety check),
+     WHATSAPP_HOME_CHANNEL
+  D) Blitz: HOST=0.0.0.0, PORT=8080 (also Dockerfile ENV defaults)
+  E) Frontend/Vercel: VITE_API_URL (client/.env.example; endings /api)
+  F) Optional: CLIENT_ORIGIN (default localhost:5173 in code), GROQ_API_KEY,
+     WHATSAPP_SETUP_TOKEN (legacy 409 routes)
+PASS (static) — naming is consistent across .env.example, server.js,
+whatsapp.service.js, system.js, hermes.js, the supervisor, the entrypoint, the
+plugin, the hook, and Hermes config_env.py (verified each var by grep at the
+referenced sources). No real secrets in .env.example (placeholders only); no
+production values hard-coded anywhere.
 
-H — ENVIRONMENT VARIABLE NAMES (values never recorded here)
-  Backend /opt/customer-ai/.env: NODE_ENV, HOST, PORT, MONGODB_URI,
-  SESSION_SECRET, AI_API_KEY, AI_MODEL, AI_CONFIDENCE_THRESHOLD,
-  HERMES_ENABLED, HERMES_HOME, HERMES_GATEWAY_STATE, HERMES_BIN,
-  HERMES_STATE_STALE_MS, CAI_HOOK_SECRET, CLIENT_ORIGIN, ADMIN_EMAIL,
-  ADMIN_PASSWORD, SEED_PRINT_CREDENTIALS, WHATSAPP_SETUP_TOKEN.
-  Hermes ~/.hermes/.env (backend does NOT read these): GROQ_API_KEY,
-  WHATSAPP_ENABLED, WHATSAPP_ALLOW_ALL_USERS, WHATSAPP_ALLOWED_USERS,
-  WHATSAPP_HOME_CHANNEL, CAI_HOOK_BASE_URL=http://127.0.0.1:5000.
-  Vercel (build-time, public): VITE_API_URL.
+===============================================================================
+11. SECURITY AUDIT
+===============================================================================
+PASS (static) — CORS allowlist via CLIENT_ORIGIN (comma-separated); no-Origin
+requests (internal webhooks) allowed.
+PASS (static) — rate limiting 240 req/min per 60s on /api with standard headers.
+PASS (static) — admin seed is safe: in production an admin is created ONLY when
+ADMIN_EMAIL + ADMIN_PASSWORD are provided; never demo/default credentials;
+SEED_PRINT_CREDENTIALS defaults false.
+PASS (static) — SESSION_SECRET required for JWT auth (12h expiry, requireAuth on
+all data routes, requireAdmin on settings writes).
+PASS (static) — webhook authentication: /api/hermes/webhook/* require
+x-cai-hook-secret validated with timing-safe compare; unconfigured secret => 503;
+gate fail-closed on non-200 / unreachable (plugin logs class/status only, never
+content).
+PASS (static) — no secrets in logs (morgan 'tiny', gateway/tap log redaction ON
+by default in config template); groq key from env only.
+PASS (static) — no JID/message-content leakage (grep clean); the real operator
+JID is not in the repo (matched against ~/.hermes config: not present).
+PASS (static) — no public pairing endpoint: /api/whatsapp/qr requires setup
+token AND always returns 404 "managed by Hermes"; connect/disconnect/reset all
+409. No QR invented/exposed.
+PASS (static) — no unrestricted WhatsApp access: allow_all_users false +
+unauthorized_dm_behavior ignore in seed config; home-channel bypass env-driven.
+PASS (static) — no debug endpoints, no dev credentials, no committed .env (only
+both .env.example tracked), no WhatsApp session, no private keys, no service
+accounts, no Firebase/Google secrets (git ls-files + pattern scans all clean).
 
-I — FINAL CHECKLIST (test-backed only)
-  [x] prod client build embeds VITE_API_URL, no localhost/dev secrets
-  [x] CORS allowlist + disallowed-origin block + preflight
-  [x] trust proxy -> rate limit uses real client IP behind Nginx
-  [x] HOST bind 127.0.0.1 default; PORT 5000 stays
-  [x] gateway staleness liveness-correct (idle, dead, recycled PID)
-  [x] JWT-guarded routes still 401 unauthenticated; health/hermes status 200
-  [x] rate limiter active (240/min) behind headers
-  [x] deploy templates + env docs + README updated
-  [x] Hermes Python compile clean; title effort low; plugin non-200 WARNING
-  [x] nothing deployed / pushed / ssh'd / paired / messaged
+===============================================================================
+12. VERCEL FRONTEND AUDIT
+===============================================================================
+PASS (static) — client/src/services/api.js uses `import.meta.env.VITE_API_URL ||
+'/api'`; vite dev proxy localhost:5000 is dev-only (never shipped).
+PASS (static) — production build with placeholder VITE_API_URL=https://
+example-blitz-domain/api succeeds; the URL is embedded in dist; bundle contains
+no localhost:5000 / ChangeMe123 / demo admin strings.
+PASS (static) — Vercel serves client/ only (vercel.json SPA rewrite; no server
+routes/functions); no server-side secrets flow through VITE (template says so);
+CORS expectation matches CLIENT_ORIGIN = https://<vercel-domain>.
+UNVERIFIED — live Vercel project settings (final Blitz domain not set yet by
+design; placeholder used).
 
-REQUIRES MANUAL ACTION (operator)
-  1. Restart the Hermes gateway so the new title_generator.py and the
-     plugin's non-200 WARNING are live (hermes gateway restart / reload).
-  2. Restart the local :5000 instance so the new whatsapp.service.js
-     PID-liveness logic loads (VPS systemd Restart=always handles its own).
-  3. If production seed ever runs, export ADMIN_EMAIL and ADMIN_PASSWORD;
-     without them no admin is created.
-  4. Deploy per readme + templates: Vercel (root client/) and VPS.
+===============================================================================
+13. STATIC TEST RESULTS
+===============================================================================
+PASS — node --check on all 16 server/supervisor JS files.
+PASS — bash -n deploy/blitz/entrypoint.sh.
+PASS — python3 -m py_compile on gate plugin + tap hook.
+PASS — diff -q: repo hermes/ plugin+hook = verified originals (verbatim).
+PASS — config template carries all security-critical keys (grep checks).
+PASS — client production build (dist): URL embedded; forbidden strings absent.
+PASS — backend local smoke (HOST=127.0.0.1 PORT=5199 TRUST_PROXY=1):
+  /api/health 200 healthy; /api/system/status backend/hermes/whatsapp CONNECTED,
+  managedBy hermes; unauth /api/conversations 401; gate webhook without secret
+  401; CORS allow reflected + disallowed origin blocked (no ACAO); no-Origin OK;
+  RateLimit-Policy 240;w=60 present; /api/whatsapp/qr and /connect 401 without
+  setup token.
+PASS — grep audit: no uid 10001 outside this report; no /root refs; no Baileys
+  in Customer AI; no secrets; no real JID; .dockerignore excludes session,
+  .env, node_modules, dist, caches, *.db; COPY sources all exist
+  (client+server lockfiles, hermes/, deploy/blitz/, dist).
+PASS — git status shows only intended files; `git diff --check` clean;
+  __pycache__ artifacts from this audit removed.
+
+===============================================================================
+14. DOCKER TEST RESULTS
+===============================================================================
+UNVERIFIED — Docker unavailable.
+  docker build (linux/amd64), docker run --user 1000:1000 --cap-drop ALL --
+  security-opt no-new-privileges, GET :8080/api/health, Hermes-startup test,
+  Hermes-home write test, persistent-volume test, and in-container HERMES_BIN
+  invocation were NOT executed. The docker CLI exists but the daemon socket
+  /var/run/docker.sock is root:docker and this shell has neither the docker
+  group nor passwordless sudo. No privilege/group changes were made; no
+  Docker-related test is claimed as PASS on the strength of static reasoning.
+
+===============================================================================
+15. WHATSAPP PAIRING STATUS
+===============================================================================
+UNVERIFIED — initial Hermes WhatsApp pairing method on Blitz Cloud.
+No interactive-shell claim, no QR endpoint, no real session copied. Status
+changes only with real verified evidence from the Blitz environment.
+
+===============================================================================
+16. REMAINING BLOCKERS
+===============================================================================
+- BLOCKER 1 (must be executed by the operator): docker build --platform
+  linux/amd64 -t customer-ai-blitz:test . — validates the Hermes clone, uv
+  sync --extra all --locked, bridge npm ci, and the uid/gid-1000 usermod path.
+- BLOCKER 2: docker run with --user 1000:1000 --cap-drop ALL --security-opt
+  no-new-privileges -v customer-ai-test:/home/customerai/.hermes + MONGODB_URI,
+  then curl /api/health (expect 200, no permission errors).
+- BLOCKER 3 (operator/console): confirm how Blitz attaches persistent storage
+  at /home/customerai/.hermes owned by uid 1000, exposes port 8080, and whether
+  it adopts the Docker HEALTHCHECK.
+- BLOCKER 4 (operator/console): the WhatsApp pairing method on Blitz
+  (interactive shell vs. pre-built paired session seeded into the volume).
+- NOTE: Blitz persistent folders are not backed up by Blitz (documented).
+
+===============================================================================
+17. EXACT NEXT STEP
+===============================================================================
+Run, on a machine with a working Docker daemon:
+  1) docker build --platform linux/amd64 -t customer-ai-blitz:test .
+  2) docker run --rm --platform linux/amd64 --user 1000:1000 --cap-drop ALL \
+     --security-opt no-new-privileges -p 8080:8080 \
+     -v customer-ai-test:/home/customerai/.hermes \
+     -e NODE_ENV=production -e HOST=0.0.0.0 -e PORT=8080 -e TRUST_PROXY=1 \
+     -e MONGODB_URI=<atlas-uri> \
+     -e HERMES_HOME=/home/customerai/.hermes -e HERMES_ENABLED=false \
+     customer-ai-blitz:test
+  3) curl -s -i http://127.0.0.1:8080/api/health   (expect 200)
+  4) Repeat with HERMES_ENABLED=true + safe test credentials; verify Hermes
+     starts, Python executes, the bridge starts, no permission errors, and
+     /home/customerai/.hermes gets seeded (config/plugin/hook).
+  5) Persistence probe: touch a harmless file in /home/customerai/.hermes,
+     stop, start a second container on the same volume, verify the file remains.
+  6) Only after 1-5 pass, configure Blitz env vars + persistent volume + port
+     8080 and resolve the WhatsApp pairing blocker (section 16).
+Do NOT pair WhatsApp or send messages during these checks.
 
 ===============================================================================
 END OF REPORT
