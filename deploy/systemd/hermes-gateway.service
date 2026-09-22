@@ -1,0 +1,33 @@
+[Unit]
+Description=Hermes Agent Gateway - Messaging Platform Integration
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=<vps-user>
+Group=<vps-user>
+# Hermes runs from its persistent data directory; the WhatsApp bridge is
+# spawned by the gateway itself as a child process, so no separate unit is
+# needed for the bridge.
+WorkingDirectory=/home/<vps-user>/.hermes
+
+Environment="PATH=/home/<vps-user>/.hermes/hermes-agent/venv/bin:/home/<vps-user>/.hermes/hermes-agent/node_modules/.bin:/home/<vps-user>/.hermes/node/bin:/home/<vps-user>/.hermes/node:/home/<vps-user>/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="VIRTUAL_ENV=/home/<vps-user>/.hermes/hermes-agent/venv"
+Environment="HERMES_HOME=/home/<vps-user>/.hermes"
+Environment="HERMES_SUPERVISED_CHILD=1"
+Environment="CAI_HOOK_BASE_URL=http://127.0.0.1:5000"
+
+ExecStart=/home/<vps-user>/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main gateway run
+
+Restart=always
+RestartSec=5
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=70
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,5 @@
-import { Clock3, UserPlus } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { Clock3, UserPlus, UserRoundCheck } from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Badge, Button, PageHeading } from '../components/UI';
 import { api } from '../services/api';
@@ -10,15 +10,41 @@ const highIntent = intent => ['REFUND', 'PAYMENT_DISPUTE', 'COMPLAINT', 'LARGE_O
 export default function HumanQueue() {
   const [items, setItems] = useState([]);
   const [notice, setNotice] = useState('');
+  const [assigningId, setAssigningId] = useState(null);
+  const [assignError, setAssignError] = useState('');
   const navigate = useNavigate();
+  const load = async () => {
+    try {
+      const data = await api('/conversations?filter=human');
+      setItems(data);
+    } catch (e) {
+      setNotice(e.message);
+    }
+  };
+  const loadRef = useRef();
+  loadRef.current = load;
   useEffect(() => {
-    api('/conversations?filter=human')
-      .then(setItems)
-      .catch(e => setNotice(e.message));
+    load();
+    const t = setInterval(() => loadRef.current(), 3000);
+    return () => clearInterval(t);
   }, []);
+  const assign = async conversation => {
+    if (assigningId) return; // prevent accidental duplicate assignment requests
+    setAssigningId(conversation._id);
+    setAssignError('');
+    try {
+      const updated = await api(`/conversations/${conversation._id}/assign`, { method: 'POST' });
+      setItems(prev => prev.map(c => (c._id === updated._id ? updated : c)));
+    } catch (e) {
+      setAssignError(e.message);
+    } finally {
+      setAssigningId(null);
+    }
+  };
   return <>
     <PageHeading eyebrow="HUMAN-IN-THE-LOOP" title="Human queue" description="Review conversations Hermes has escalated for your approval." />
     {notice && <p className="setup-error">{notice}</p>}
+    {assignError && <p className="setup-error">{assignError}</p>}
     <div className="queue-stats">
       <div><b>{items.length}</b><span>Waiting for review</span></div>
       <div><b>{items.filter(c => highIntent(c.lastMessage?.aiIntent)).length}</b><span>High priority</span></div>
@@ -38,7 +64,12 @@ export default function HumanQueue() {
           </div>
           <div className="queue-actions">
             <Badge tone="purple">{c.lastMessage?.aiIntent || c.status}</Badge>
-            <Button variant="outline"><UserPlus size={16}/> Assign</Button>
+            <span className="assigned-note">
+              {c.assignedTo?.name && <><UserRoundCheck size={15}/> Assigned to {c.assignedTo.name}</>}
+            </span>
+            {!c.assignedTo?.name
+              ? <Button variant="outline" disabled={!!assigningId} onClick={() => assign(c)}><UserPlus size={16}/> {assigningId === c._id ? 'Assigning…' : 'Assign to me'}</Button>
+              : <Button variant="outline" disabled={true}>Assigned</Button>}
             <Button onClick={() => navigate(`/conversations/${c._id}`)}>Open conversation</Button>
           </div>
         </article>

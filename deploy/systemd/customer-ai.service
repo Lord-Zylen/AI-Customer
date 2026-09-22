@@ -1,0 +1,32 @@
+[Unit]
+Description=Customer AI API (Node backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=<vps-user>
+Group=<vps-user>
+WorkingDirectory=/opt/customer-ai/server
+
+# The .env file holds all backend secrets (NODE_ENV=production, HOST,
+# MONGODB_URI, SESSION_SECRET, AI_API_KEY, CAI_HOOK_SECRET, CLIENT_ORIGIN, ...).
+# Set mode 600 and own it by <vps-user>.
+EnvironmentFile=/opt/customer-ai/.env
+
+ExecStart=/usr/bin/node src/server.js
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+
+# Production hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=false
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,1 +1,0 @@
-import {Router} from 'express';import {requireAuth} from '../middleware/auth.js';import {processIncomingCustomerMessage} from '../services/message-processing.service.js';const router=Router();router.post('/process',requireAuth,async(req,res,next)=>{try{res.json(await processIncomingCustomerMessage(req.body))}catch(e){next(e)}});export default router;
