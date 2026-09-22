@@ -1,0 +1,167 @@
+===============================================================================
+Customer AI <-> Hermes <-> WhatsApp — LATEST UPDATE (2026-09-22)
+===============================================================================
+  This file is the single current update only; prior update content was
+  deleted. Baseline facts it replaces (previously verified): human-queue
+  assignment (Fix 1), Groq title reasoning_effort=low (Fix 2), rate limit
+  240/min (Fix 8), prod-seed credential safety (Fix 4), agent:end recording
+  edge cases (Fix 5), plugin non-200 WARNING (Fix 6), 409 managed-by-Hermes
+  contract (Fix 7), and the gateway-staleness handling now superseded by the
+  PID-liveness model below.
+
+SCOPE OF THIS UPDATE
+  Production deployment preparation — repo-side and verified locally only.
+  Nothing was deployed, pushed, SSH'd, paired, or messaged. Local WhatsApp
+  session untouched.
+
+A — TARGET ARCHITECTURE
+  Vercel       : React frontend (PUSH client/ only). SPA; no serverless funcs.
+  VPS          : Customer AI Node backend + Hermes gateway (+ WhatsApp bridge
+                 child) + Nginx TLS. Native systemd; Docker optional legacy.
+  MongoDB      : Atlas, external (MONGODB_URI), no local mongod dependency.
+
+B — FILES CHANGED (this round)
+  server/src/server.js
+      + binds HOST (env, default 127.0.0.1) — Node never exposed on a public
+        port; Nginx terminates TLS to 127.0.0.1:5000 (HOST=0.0.0.0 only if a
+        container needs it).
+      + CORS allowlist from CLIENT_ORIGIN as a comma-separated list, e.g.
+        'https://customer-ai.vercel.app,http://localhost:5173'. Disallowed
+        origins are NOT reflected (no ACAO -> browser blocks). Requests with
+        no Origin (Hermes webhooks, curl) still pass.
+      + app.set('trust proxy', 1) so the /api 240/min rate limit keys on the
+        REAL client IP behind Nginx (otherwise all users share the proxy's IP
+        and the aggregate limit misfires). Safe here because the backend
+        binds 127.0.0.1 and only Nginx can reach it.
+
+  server/src/services/whatsapp.service.js
+      HERMES_HOME          (env) defaults to ~/.hermes        (already existed)
+      HERMES_GATEWAY_STATE (env) defaults to HERMES_HOME/gateway_state.json
+                            (already existed)
+      + HERMES_STATE_STALE_MS default 300000 (5 min) — an age SUSPICION only.
+      + PID-liveness fallback (replaces the earlier age-only rule): the
+        gateway only rewrites gateway_state.json on lifecycle transitions and
+        agent turn boundaries (the 30s heartbeat lives in the separate
+        state/gateway.heartbeat file), so an idle but healthy gateway's state
+        file legitimately ages. Age alone therefore caused false "stopped
+        reporting" alarms. Stale is now true only when:
+            updated_at older than STATE_STALE_MS
+            AND the recorded gateway PID is NOT alive
+            (or its /proc/<pid>/stat field-22 start-time fingerprint does not
+             match the recorded start_time — PID-reuse guard, the same model
+             Hermes itself uses).
+      + stale gateway -> DISCONNECTED with
+        ("The Hermes gateway stopped reporting status; check that it is running.").
+      + unreadable/missing file -> DISCONNECTED + generic
+        "WhatsApp status is unavailable right now." — never leaks filesystem
+        paths to the browser.
+      + exposes a "stale" boolean in the status payload.
+
+  client/.env.example        (NEW) VITE_API_URL build-time doc.
+  client/vercel.json         (NEW) SPA rewrite: all routes -> /index.html.
+  .env.example               Rewritten to match the actual production vars:
+                             backend (server) section + Hermes-side reference
+                             section + Vercel VITE_API_URL section.
+  deploy/systemd/customer-ai.service        (NEW) unit template.
+  deploy/systemd/hermes-gateway.service     (NEW) unit template (spawns the
+                             child bridge; replace <vps-user>).
+  deploy/nginx/customer-ai.conf             (NEW) TLS -> 127.0.0.1:5000
+                             template (replace api.example.com + cert paths).
+  README.md                  Deployment section rewritten: Vercel + VPS +
+                             Nginx + Atlas; removed stale PostgreSQL / Docker
+                             / Customer-AI-Baileys-QR instructions.
+  .gitignore                 Fixed so both .env.example files are trackable
+                             (added !client/.env.example; dropped the trailing
+                             redundant .env.example ignore rule).
+
+C — VERCEL (frontend)
+  Project Root Directory = client/
+  Build command = npm run build   |   Output directory = dist
+  Env: VITE_API_URL=https://api.example.com/api  (public, ends with /api)
+  client/vercel.json rewrites all paths to /index.html (SPA).
+  Verified: build with VITE_API_URL emits the URL into dist bundle; grep for
+  localhost:5000 / 127.0.0.1:5000 / ChangeMe123! / admin@customer-ai.test in
+  dist -> NONE (dev-only login autofill is tree-shaken from prod builds).
+
+D — VPS (backend + Hermes)
+  Ubuntu + Node 22 (Dockerfile base; local is 24). Repo at /opt/customer-ai,
+  backend exec dir /opt/customer-ai/server, config file /opt/customer-ai/.env
+  (chmod 600, owned by the service user).
+  Nginx: deploy/nginx/customer-ai.conf -> HTTPS api.example.com ->
+  127.0.0.1:5000; long proxy timeouts (300s) so AI-classify webhooks don't cut.
+  Hermes: persistent ~/.hermes (venv ~/.hermes/hermes-agent/venv, launcher
+  ~/.local/bin/hermes, gateway cmd `python -m hermes_cli.main gateway run`,
+  spawns the WhatsApp bridge as a child). Daemon via
+  deploy/systemd/hermes-gateway.service (system-level equivalent of the
+  existing local user unit; WorkingDirectory ~/.hermes, HERMES_HOME, persist).
+  Hermes config to preserve on the VPS (verbatim from the verified local
+  machine): allow_all_users:false, unauthorized_dm_behavior:ignore,
+  delivery_ledger:true, display.show_reasoning:true +
+  platforms.whatsapp.show_reasoning:false, agent.reasoning_effort:medium,
+  title-generator reasoning_effort:low (never none), provider groq key_env
+  GROQ_API_KEY, home_channel whatsapp, profile hermes-whatsapp.
+
+E — DNS
+  api.example.com  A/AAAA -> VPS public IP.
+  Vercel provides *.vercel.app automatically; no custom domain required.
+
+F — VERIFICATION RUN LOCALLY (ALL PASS; rerun on the VPS after deploy)
+  1) (cd client && VITE_API_URL=https://api.example.com/api npm run build)
+     -> dist bundles the prod URL; no localhost strings; no demo creds.
+  2) node --check on every edited server file.
+  3) Throwaway :5199 (real code, project DB, real gateway_state.json):
+     /api/health -> healthy/connected; /api/system/status -> backend+hermes
+     CONNECTED, groq CONFIGURED; /api/hermes/status -> secretConfigured:true,
+     endpoints list; /api/conversations without JWT -> 401;
+     RateLimit-Policy: 240;w=60 headers present.
+  4) CORS: Origin https://customer-ai.vercel.app -> reflected; preflight OK;
+     Origin https://evil.example.com -> no ACAO (blocked); no-Origin webhook
+     style request -> passes.
+  5) Staleness matrix: A live-idle real gateway CONNECTED/stale:false;
+     B dead pid DISCONNECTED/stale:true; C recycled pid (start-time mismatch)
+     stale:true; fresh-file-from-dead-pid still DISCONNECTED; missing file no
+     crash. (PID 999999 for dead; real pid 38188 with tampered start_time.)
+  6) python3 -m py_compile on Hermes title_generator.py + customer-ai-gate.
+
+G — AFTER DEPLOY ON THE VPS (operator; NOT performed here)
+  WhatsApp pairing happens ON THE VPS only, into ~/.hermes persistent session.
+  Do NOT copy or reuse the local WhatsApp session. Pair via the Hermes tooling
+  on the VPS; then confirm hermes gateway status shows connected and the
+  dashboard /api/system/status flips to whatsapp CONNECTED. First E2E: reply
+  to an inbound chat and confirm a Customer AI row appears.
+
+H — ENVIRONMENT VARIABLE NAMES (values never recorded here)
+  Backend /opt/customer-ai/.env: NODE_ENV, HOST, PORT, MONGODB_URI,
+  SESSION_SECRET, AI_API_KEY, AI_MODEL, AI_CONFIDENCE_THRESHOLD,
+  HERMES_ENABLED, HERMES_HOME, HERMES_GATEWAY_STATE, HERMES_BIN,
+  HERMES_STATE_STALE_MS, CAI_HOOK_SECRET, CLIENT_ORIGIN, ADMIN_EMAIL,
+  ADMIN_PASSWORD, SEED_PRINT_CREDENTIALS, WHATSAPP_SETUP_TOKEN.
+  Hermes ~/.hermes/.env (backend does NOT read these): GROQ_API_KEY,
+  WHATSAPP_ENABLED, WHATSAPP_ALLOW_ALL_USERS, WHATSAPP_ALLOWED_USERS,
+  WHATSAPP_HOME_CHANNEL, CAI_HOOK_BASE_URL=http://127.0.0.1:5000.
+  Vercel (build-time, public): VITE_API_URL.
+
+I — FINAL CHECKLIST (test-backed only)
+  [x] prod client build embeds VITE_API_URL, no localhost/dev secrets
+  [x] CORS allowlist + disallowed-origin block + preflight
+  [x] trust proxy -> rate limit uses real client IP behind Nginx
+  [x] HOST bind 127.0.0.1 default; PORT 5000 stays
+  [x] gateway staleness liveness-correct (idle, dead, recycled PID)
+  [x] JWT-guarded routes still 401 unauthenticated; health/hermes status 200
+  [x] rate limiter active (240/min) behind headers
+  [x] deploy templates + env docs + README updated
+  [x] Hermes Python compile clean; title effort low; plugin non-200 WARNING
+  [x] nothing deployed / pushed / ssh'd / paired / messaged
+
+REQUIRES MANUAL ACTION (operator)
+  1. Restart the Hermes gateway so the new title_generator.py and the
+     plugin's non-200 WARNING are live (hermes gateway restart / reload).
+  2. Restart the local :5000 instance so the new whatsapp.service.js
+     PID-liveness logic loads (VPS systemd Restart=always handles its own).
+  3. If production seed ever runs, export ADMIN_EMAIL and ADMIN_PASSWORD;
+     without them no admin is created.
+  4. Deploy per readme + templates: Vercel (root client/) and VPS.
+
+===============================================================================
+END OF REPORT
+===============================================================================

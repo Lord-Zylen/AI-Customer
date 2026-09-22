@@ -2,12 +2,51 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 
 const HERMES_HOME = process.env.HERMES_HOME || path.join(os.homedir(), '.hermes');
 const GATEWAY_STATE_PATH = process.env.HERMES_GATEWAY_STATE || path.join(HERMES_HOME, 'gateway_state.json');
 const HERMES_BIN = process.env.HERMES_BIN || 'hermes';
+// The Hermes gateway only rewrites gateway_state.json on lifecycle transitions
+// and agent turn boundaries; the 30s heartbeat lives in a separate file
+// (state/gateway.heartbeat). A healthy but idle gateway can therefore leave the
+// state file untouched for a long time. Age alone is thus only a *suspicion*;
+// the decisive signal is whether the recorded gateway PID is still alive and
+// matches the recorded start_time (same PID-reuse guard Hermes itself uses).
+const STATE_STALE_MS = Number(process.env.HERMES_STATE_STALE_MS) || 300000;
+
+const UNAVAILABLE_MESSAGE = 'WhatsApp status is unavailable right now.';
 
 let cachedState = { status: 'DISCONNECTED', qr: null, phone: null, updatedAt: null, error: null, managedBy: 'hermes' };
+
+function stateIsStale(updatedAt) {
+  const ts = Date.parse(updatedAt);
+  return Number.isNaN(ts) ? true : Date.now() - ts > STATE_STALE_MS;
+}
+
+function processStartTimeTicks(pid) {
+  try {
+    const fields = readFileSync(`/proc/${pid}/stat`, 'utf8').trim().split(/\s+/);
+    const startTime = Number(fields[21]);
+    return Number.isNaN(startTime) ? null : startTime;
+  } catch {
+    return null;
+  }
+}
+
+function processIsAlive(pid, startTime) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error?.code !== 'EPERM') return false;
+  }
+  if (startTime == null) return true;
+  const current = processStartTimeTicks(pid);
+  if (current == null) return true;
+  const recorded = Number(startTime);
+  return recorded > 0 && Math.abs(current - recorded) <= 0.001;
+}
 
 async function readGatewayState() {
   try {
@@ -15,17 +54,22 @@ async function readGatewayState() {
     const data = JSON.parse(raw);
     const whatsapp = data?.platforms?.whatsapp;
     const connected = whatsapp?.state === 'connected' && data?.gateway_state === 'running';
+    const stale = stateIsStale(data?.updated_at) && !processIsAlive(data?.pid, data?.start_time);
+    const effectivelyConnected = connected && !stale;
     cachedState = {
-      status: connected ? 'CONNECTED' : 'DISCONNECTED',
+      status: effectivelyConnected ? 'CONNECTED' : 'DISCONNECTED',
       qr: null,
       phone: null,
       updatedAt: data?.updated_at || null,
-      error: connected ? null : (whatsapp?.error_message || 'Hermes gateway is not connected to WhatsApp yet.'),
+      stale,
+      error: effectivelyConnected
+        ? null
+        : (stale ? 'The Hermes gateway stopped reporting status; check that it is running.' : (whatsapp?.error_message || 'Hermes gateway is not connected to WhatsApp yet.')),
       managedBy: 'hermes',
       gatewayState: data?.gateway_state || null,
     };
   } catch {
-    cachedState = { ...cachedState, status: 'DISCONNECTED', qr: null, error: null, gatewayState: null };
+    cachedState = { ...cachedState, status: 'DISCONNECTED', qr: null, stale: true, error: UNAVAILABLE_MESSAGE, gatewayState: null };
   }
   return cachedState;
 }

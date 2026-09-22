@@ -4,15 +4,15 @@ import BusinessSettings from '../models/BusinessSettings.js';
 const sensitive = ['REFUND', 'PAYMENT_DISPUTE', 'COMPLAINT', 'DISCOUNT_REQUEST', 'LARGE_ORDER', 'UNKNOWN'];
 const FALLBACK_MODELS = ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile'];
 const classify = (text) => {
-  const v = text.toLowerCase();
-  if (/refund|money back/.test(v)) return 'REFUND';
+  const v = ` ${text.toLowerCase()} `;
+  if (/\brefund\b|money back/.test(v)) return 'REFUND';
   if (/complain|angry|terrible/.test(v)) return 'COMPLAINT';
-  if (/paid|payment|charged/.test(v)) return 'PAYMENT_DISPUTE';
-  if (/discount/.test(v)) return 'DISCOUNT_REQUEST';
-  if (/bulk|wholesale|[3-9]\d bags/.test(v)) return 'LARGE_ORDER';
-  if (/price|cost|how much/.test(v)) return 'PRICE_ENQUIRY';
-  if (/deliver|delivery/.test(v)) return 'DELIVERY';
-  if (/hello|hi|good morning/.test(v)) return 'GENERAL';
+  if (/\bpaid\b|\bpayment\b|\bcharged\b/.test(v)) return 'PAYMENT_DISPUTE';
+  if (/\bdiscount\b/.test(v)) return 'DISCOUNT_REQUEST';
+  if (/\bbulk\b|\bwholesale\b|[3-9]\d bags/.test(v)) return 'LARGE_ORDER';
+  if (/\bprice\b|\bcost\b|\bhow much\b/.test(v)) return 'PRICE_ENQUIRY';
+  if (/\bdeliver(y|ies|ing|ed)?\b/.test(v)) return 'DELIVERY';
+  if (/\bhi\b|\bhello\b|\bgood morning\b/.test(v)) return 'GENERAL';
   return 'UNKNOWN';
 };
 

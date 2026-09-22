@@ -6,7 +6,6 @@ import {
   inboundDedupeKey,
   recordOutboundAi,
 } from '../services/message-processing.service.js';
-import { triageMessage } from '../services/hermes.service.js';
 
 const router = Router();
 
@@ -34,10 +33,6 @@ function requireHookSecret(req, res, next) {
 }
 
 router.get('/status', (req, res) => res.json({ secretConfigured: secretConfigured(), endpoints: ['webhook/gate', 'webhook/event', 'webhook/knowledge'] }));
-
-router.post('/process-message', async (req, res, next) => {
-  try { res.json(await triageMessage(req.body)); } catch (e) { next(e); }
-});
 
 function textAndMedia(body) {
   const media = Array.isArray(body?.media_urls) && body.media_urls.length > 0;

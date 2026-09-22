@@ -8,19 +8,26 @@ Customer AI is a WhatsApp customer service workspace. Hermes triages messages, r
 2. Run `npm run install:all`.
 3. Run `npm run dev` and open `http://localhost:5173`.
 
-The frontend is a WhatsApp inbox with a human-review queue, business settings that feed Hermes, a WhatsApp pairing screen, and a system-status page. The Express server exposes `/api/health`, `/api/hermes/process-message`, and the WhatsApp conversation APIs.
+The frontend is a WhatsApp inbox with a human-review queue, business settings that feed Hermes, a WhatsApp pairing screen, and a system-status page. The Express server exposes `/api/health`, the Hermes webhooks (`/api/hermes/webhook/gate`, `/api/hermes/webhook/event`, `/api/hermes/webhook/knowledge`), and the WhatsApp conversation APIs.
 
 ## Integration boundaries
 
-`server/src/services/hermes.service.js` is the Hermes orchestration boundary; replace its rule-based starter with the Hermes SDK/configuration. Keep WhatsApp gateway code in a dedicated service and call the Hermes route after webhook validation.
+WhatsApp is owned by the Hermes gateway (single connection). Hermes calls Customer AI's `pre_gateway_dispatch` plugin and mirror hooks (`~/.hermes/plugins/customer-ai-gate`, `~/.hermes/hooks/customer_ai_tap`), which POST to `/api/hermes/webhook/*`. Human replies from the dashboard are sent through the `hermes send` CLI via `server/src/services/whatsapp.service.js`.
 
-## Deploy with WhatsApp QR pairing
+## Production deployment
 
-1. Create `.env` from `.env.example`. Set strong, unique `SESSION_SECRET`, `POSTGRES_PASSWORD`, and `WHATSAPP_SETUP_TOKEN` values.
-2. Start Customer AI and PostgreSQL: `docker compose up -d --build`.
-3. Publish port `5000` through a TLS reverse proxy. Customer AI serves both the web app and `/api` from that port.
-4. Open **WhatsApp setup** in Customer AI, enter the setup token, generate the QR code, then scan it in WhatsApp: **Settings → Linked devices → Link a device**.
+Target architecture (supported, native — no Docker required):
 
-The named `whatsapp_auth` Docker volume retains the WhatsApp session across deployment restarts. Do not delete it unless you intentionally want to pair a new account.
+- **Vercel** serves `/client` (Vite React) with `VITE_API_URL` pointing at the VPS API.
+- **VPS** runs the Node backend (`server/`, `node src/server.js`) behind Nginx (HTTPS) + the Hermes gateway as a systemd service. Hermes owns the WhatsApp session in its persistent `~/.hermes` directory; the bridge is spawned by the gateway.
+- **MongoDB Atlas** stays external (`MONGODB_URI`).
 
-QR pairing uses Baileys and the WhatsApp Web protocol; it is not Meta’s official Business API. It is suitable for a consent-based operational account. For Meta-approved high-volume messaging, replace the adapter in `server/src/services/whatsapp.service.js` with WhatsApp Business Cloud API while preserving its interface.
+Read `customer-ai-debug-report.txt` for the full runbook. Deployment templates:
+
+- `client/vercel.json` — Vercel SPA routing; deploy with build `npm run build`, output `dist`.
+- `deploy/systemd/customer-ai.service` — backend service.
+- `deploy/systemd/hermes-gateway.service` — Hermes gateway service (spawns the WhatsApp bridge).
+- `deploy/nginx/customer-ai.conf` — reverse proxy template (`https://api.example.com` → `127.0.0.1:5000`).
+- `.env.example` — full production environment reference.
+
+WhatsApp pairing happens **after** the VPS and Nginx are working, and only on the VPS's persistent Hermes directory. Never reset or copy the local session during deployment.
