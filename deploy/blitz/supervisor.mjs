@@ -1,5 +1,5 @@
 // ============================================================================
-// Customer AI — container process supervisor (Blitz Cloud, runs as PID 1)
+// Customer AI — container process supervisor (Render, runs as PID 1)
 //
 // Starts the Customer AI Node backend, waits for /api/health, then starts the
 // Hermes gateway (which spawns the WhatsApp Baileys bridge as its own child).

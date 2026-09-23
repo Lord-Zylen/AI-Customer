@@ -1,28 +1,31 @@
 # syntax=docker/dockerfile:1
 
 # ============================================================================
-# Customer AI — Blitz Cloud production image
+# Customer AI — Render production image
 #
-# One non-root container (uid/gid 1000, matching Blitz's runtime user) running:
-#   1. Customer AI Node backend   (HOST=0.0.0.0, PORT=8080)
+# One non-root container (uid/gid 1000) running:
+#   1. Customer AI Node backend   (HOST=0.0.0.0, PORT from Render's PORT env)
 #   2. Hermes gateway             (python -m hermes_cli.main gateway run)
 #   3. Hermes WhatsApp bridge     (spawned by the gateway as a child process)
 #
-# PERSISTENCE (CRITICAL): /home/customerai/.hermes must be backed by Blitz
-# persistent storage (declared via VOLUME). The WhatsApp session, Hermes
-# databases and logs live there. Losing that directory can require re-pairing
-# WhatsApp. The image ships an EMPTY Hermes home — never a local session.
+# PERSISTENCE (CRITICAL): attach a Render Persistent Disk at /app/data. The
+# Hermes home ($HERMES_HOME=/app/data/hermes) and WhatsApp auth
+# ($WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth) live there. Losing that
+# directory can require re-pairing WhatsApp. The image ships an EMPTY Hermes
+# home — never a local session.
 #
-# Build:  docker build --platform linux/amd64 -t customer-ai-blitz:test .
-# Run:    docker run --rm --platform linux/amd64 --user 1000:1000 \
-#          --cap-drop ALL --security-opt no-new-privileges -p 8080:8080 \
-#          -v customer-ai-test:/home/customerai/.hermes \
+# Build:  docker build -t customer-ai-render:test .
+# Run:    docker run --rm --user 1000:1000 \
+#          -p 8080:8080 \
+#          -v customer-ai-test:/app/data \
 #          -e NODE_ENV=production -e HOST=0.0.0.0 -e PORT=8080 -e TRUST_PROXY=1 \
-#          -e MONGODB_URI=<atlas-uri> \   # /api/health is DB-backed: 200 only when
-#                                          # MongoDB is reachable; omit => 503 =>
-#                                          # the supervisor exits after the wait.
-#          -e HERMES_HOME=/home/customerai/.hermes -e HERMES_ENABLED=false \
-#          customer-ai-blitz:test
+#          -e MONGODB_URI=<atlas-uri> -e REDIS_URL=<redis-cloud-url> \
+#          -e CLIENT_ORIGIN=https://<vercel-domain> \
+#          -e CAI_HOOK_SECRET=<secret> \
+#          # /api/health is DB-backed: 200 only when MongoDB is reachable;
+#          # omit MONGODB_URI => 503 => the supervisor exits after the wait.
+#          -e HERMES_HOME=/app/data/hermes -e HERMES_ENABLED=false \
+#          customer-ai-render:test
 #
 # All secrets are injected as environment variables at runtime — never baked
 # into the image.
@@ -48,11 +51,15 @@ ENV DEBIAN_FRONTEND=noninteractive
 ENV HOME=/home/customerai
 ENV NODE_ENV=production
 ENV HOST=0.0.0.0
+# Render injects its own PORT at runtime (the container listens on $PORT).
+# 8080 is the readiness/health fallback for local Docker runs.
 ENV PORT=8080
-ENV HERMES_HOME=/home/customerai/.hermes
+ENV HERMES_HOME=/app/data/hermes
 ENV HERMES_BIN=/home/customerai/.local/bin/hermes
-ENV HERMES_GATEWAY_STATE=/home/customerai/.hermes/gateway_state.json
-ENV CAI_HOOK_BASE_URL=http://127.0.0.1:8080
+ENV HERMES_GATEWAY_STATE=/app/data/hermes/gateway_state.json
+ENV WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth
+# CAI_HOOK_BASE_URL is NOT hardcoded here: the entrypoint derives it from $PORT
+# if the operator did not set it explicitly (Render's PORT is dynamic).
 ENV PATH=/home/customerai/.local/bin:/opt/hermes-agent/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # System deps: Python 3.11 (Hermes venv, requires-python >=3.11,<3.14),
@@ -84,14 +91,17 @@ RUN usermod --login customerai --home /home/customerai --move-home node \
     && test "$(id -g customerai)" -eq 1000
 
 # Runtime write paths:
-#   - /home/customerai*            owned by customerai (uid 1000)
-#   - /opt/hermes-agent            owned by customerai (incl. the writable
-#                                  WhatsApp-bridge dir and its node_modules)
-#   - /opt/customer-ai, /app       read-only at runtime, customerai-owned
+#   - /app/data*                    persistent (Render Persistent Disk): Hermes
+#                                   home + WhatsApp auth — created & pre-owned
+#                                   here so the non-root runtime can write them.
+#   - /home/customerai*             owned by customerai (uid 1000)
+#   - /opt/hermes-agent             owned by customerai (incl. the writable
+#                                   WhatsApp-bridge dir and its node_modules)
+#   - /opt/customer-ai, /app        read-only at runtime, customerai-owned
 #   - /tmp, /var/tmp               world-writable (Hermes/Node temp)
 # The only root-owned tree (from the build-time `npm ci`) is
 # /app/server/node_modules, which is read-only at runtime.
-RUN mkdir -p /opt/customer-ai/hermes-config /opt/customer-ai/bridge /app \
+RUN mkdir -p /opt/customer-ai/hermes-config /opt/customer-ai/bridge /app /app/data/hermes /app/data/whatsapp-auth \
     && chown -R customerai:customerai /opt/hermes-agent /opt/customer-ai /app /home/customerai
 
 WORKDIR /app/server
@@ -128,10 +138,11 @@ RUN printf '#!/usr/bin/env bash\nunset PYTHONPATH PYTHONHOME\nexec /opt/hermes-a
 
 EXPOSE 8080
 
-# Persistent Hermes home — must be backed by Blitz persistent storage. Declared
-# so a fresh container gets an empty production Hermes home (the image ships no
-# session data; the local developer's ~/.hermes is never copied in).
-VOLUME ["/home/customerai/.hermes"]
+# Persistence is provided by a Render Persistent Disk mounted at /app/data
+# (see render.yaml). No Docker VOLUME: a VOLUME instruction would make
+# Render/Docker allocate an anonymous volume that can shadow the mounted
+# disk. The image ships no session data; the local developer's ~/.hermes is
+# never copied in.
 
 # /api/health is DB-backed but independent of WhatsApp being connected.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \

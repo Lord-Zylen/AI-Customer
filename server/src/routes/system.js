@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { databaseStatus } from '../services/database.service.js';
 import { getWhatsAppStatus } from '../services/whatsapp.service.js';
+import { redisHealthStatus } from '../services/redis.service.js';
 
 const router = Router();
 router.get('/status', async (req, res) => {
@@ -12,6 +13,7 @@ router.get('/status', async (req, res) => {
     res.json({
       backend: 'CONNECTED',
       mongodb: databaseStatus(),
+      redis: await redisHealthStatus(),
       groq: process.env.AI_API_KEY ? 'CONFIGURED' : 'NOT CONFIGURED',
       hermes,
       whatsapp: whatsapp.status === 'CONNECTED' ? 'CONNECTED' : 'NOT CONNECTED',

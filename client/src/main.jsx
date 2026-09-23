@@ -5,5 +5,6 @@ import App from './App';
 import './styles.css';
 import './extras.css';
 import './whatsapp.css';
+import './pages.css';
 
 createRoot(document.getElementById('root')).render(<React.StrictMode><BrowserRouter><App /></BrowserRouter></React.StrictMode>);

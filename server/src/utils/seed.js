@@ -8,9 +8,10 @@ import Message from '../models/Message.js';
 import BusinessSettings from '../models/BusinessSettings.js';
 
 const isProduction = process.env.NODE_ENV === 'production';
-const adminEmail = (process.env.ADMIN_EMAIL || '').trim();
+const adminEmail = (process.env.ADMIN_EMAIL || '').trim().toLowerCase();
 const adminPassword = process.env.ADMIN_PASSWORD || '';
 const printCredentials = process.env.SEED_PRINT_CREDENTIALS === 'true';
+const demoEnabled = !isProduction && process.env.SEED_DEMO === 'true';
 
 await connectDatabase();
 await Promise.all([
@@ -21,30 +22,33 @@ await Promise.all([
   BusinessSettings.deleteMany({}),
 ]);
 
-// Production must never ship with default/demo credentials. Only a real admin
-// is created, and only when one is explicitly provided via environment
-// variables. In development the demo admin + fixture data stay for convenience.
-if (isProduction && adminEmail && adminPassword) {
-  await User.create({
-    name: 'Administrator',
-    email: adminEmail,
-    passwordHash: await bcrypt.hash(adminPassword, 12),
-    role: 'ADMIN',
-  });
+// Configured credentials always win. ADMIN_EMAIL + ADMIN_PASSWORD from the
+// environment create (or update, by email) the production admin. The demo
+// admin is only created in development when explicitly enabled via
+// SEED_DEMO=true, and never alongside/handle-away configured credentials.
+async function upsertAdmin(email, password, name, role) {
+  const passwordHash = await bcrypt.hash(password, 12);
+  return User.findOneAndUpdate(
+    { email },
+    { $set: { name, role, passwordHash } },
+    { upsert: true, new: true, runValidators: true },
+  );
+}
+
+if (adminEmail && adminPassword) {
+  await upsertAdmin(adminEmail, adminPassword, 'Administrator', 'ADMIN');
   console.log(`Seeded admin user: ${adminEmail}`);
   if (printCredentials) console.log(`Admin password: ${adminPassword}`);
-} else if (!isProduction) {
-  const demo = {
-    name: 'Adwoa Mensah',
-    email: 'admin@customer-ai.test',
-    passwordHash: await bcrypt.hash('ChangeMe123!', 12),
-    role: 'ADMIN',
-  };
-  await User.create(demo);
-  if (printCredentials) console.log('Seeded admin user: admin@customer-ai.test');
-  if (printCredentials) console.log('Demo admin password: (development only) provided to the developer');
+} else if (demoEnabled) {
+  await upsertAdmin('admin@customer-ai.test', 'ChangeMe123!', 'Adwoa Mensah', 'ADMIN');
+  console.log('Seeded demo admin user: admin@customer-ai.test (development mode only)');
+  if (printCredentials) console.log('Demo admin password: ChangeMe123!');
 } else {
-  console.log('Production: no admin seeded. Set ADMIN_EMAIL and ADMIN_PASSWORD to create an admin.');
+  console.log(
+    isProduction
+      ? 'No admin seeded. Set ADMIN_EMAIL and ADMIN_PASSWORD in .env, then run `npm run seed --prefix server`.'
+      : 'No admin seeded. Set ADMIN_EMAIL and ADMIN_PASSWORD, or enable SEED_DEMO=true (development only), then run `npm run seed --prefix server`.',
+  );
 }
 
 // Fixture/demo data only in non-production.

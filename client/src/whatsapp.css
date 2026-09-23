@@ -1,1 +1,39 @@
-.whatsapp-setup{display:grid;grid-template-columns:minmax(0,1fr) 290px;gap:18px;max-width:950px}.pairing-card{padding:24px}.pairing-heading{display:flex;align-items:center;gap:12px;border-bottom:1px solid #eceaf2;padding-bottom:18px}.wa-icon{width:43px;height:43px;border-radius:9px;background:#e7f7ef;color:#329b69;display:grid;place-items:center}.pairing-heading h2{font:700 16px Manrope;margin:0}.pairing-heading p{font-size:11px;color:#858296;margin:4px 0}.pairing-heading .badge{margin-left:auto}.token-field{display:grid;gap:6px;margin:19px 0}.token-field span{font-size:11px;font-weight:700}.token-field input{height:38px;border:1px solid #e0dee8;border-radius:7px;padding:0 10px;outline-color:#7565e5}.token-field small{font-size:10px;color:#918e9e}.start-pairing,.connected-state{text-align:center;padding:42px 15px 24px}.start-pairing>svg{color:#7565e5}.start-pairing h3,.connected-state h3,.qr-state h3{font:700 16px Manrope;margin:12px 0 5px}.start-pairing p,.connected-state p,.qr-state p{font-size:12px;color:#858296;line-height:1.5;max-width:340px;margin:0 auto 18px}.connected-state>svg{color:#35a873}.qr-state{padding:25px 10px 8px;display:flex;gap:28px;align-items:center;justify-content:center}.qr-state img{width:215px;height:215px;padding:8px;border:1px solid #e3e1eb;border-radius:9px}.qr-state>div{max-width:250px}.qr-state p{margin:0 0 12px}.qr-note{display:flex;gap:6px;color:#6f63bd!important;font-size:10px!important}.setup-error{font-size:11px;color:#cb5c53;background:#ffefed;padding:9px;border-radius:6px}.setup-guide{background:#282542;border-radius:10px;color:#fff;padding:22px}.setup-guide h3{font:700 15px Manrope;margin:0 0 17px}.setup-guide div{display:flex;gap:9px;margin:15px 0}.setup-guide div span{background:#7162da;min-width:20px;height:20px;border-radius:50%;display:grid;place-items:center;font-size:10px;font-weight:700}.setup-guide p{font-size:11px;line-height:1.5;color:#d2d0df;margin:0}.setup-note{border-top:1px solid #464260;padding-top:15px;margin-top:19px!important;color:#aaa6c0!important;font-size:10px!important}@media(max-width:700px){.whatsapp-setup{grid-template-columns:1fr}.setup-guide{display:none}.qr-state{flex-direction:column;text-align:center}}
+/* ============================================================
+   WhatsApp page
+   ============================================================ */
+.whatsapp-setup { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(0, 1fr); gap: 18px; align-items: start; }
+
+.wa-hero {
+  display: flex; align-items: center; gap: 18px; padding: 26px 26px;
+  background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: var(--shadow-sm);
+}
+.wa-hero-icon {
+  width: 64px; height: 64px; border-radius: 18px; display: grid; place-items: center; flex: none;
+}
+.wa-hero-icon.ok { background: var(--green-soft); color: var(--green); }
+.wa-hero-icon.idle { background: var(--surface-sunken); color: var(--ink-3); }
+.wa-hero-copy { flex: 1; min-width: 0; }
+.wa-hero-copy h2 { font: 800 19px Manrope; color: var(--ink); }
+.wa-hero-copy p { font-size: 13px; color: var(--ink-2); margin-top: 6px; line-height: 1.55; max-width: 520px; }
+.wa-hero-meta { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; font-size: 12px; color: var(--ink-3); }
+.wa-hero-meta span { display: inline-flex; align-items: center; gap: 6px; }
+.wa-refresh { flex: none; }
+
+.setup-guide .guide-steps { padding: 8px 10px 14px; display: grid; gap: 4px; }
+.guide-step { display: flex; gap: 14px; align-items: flex-start; padding: 12px 10px; border-radius: 10px; }
+.guide-step:hover { background: var(--surface-2); }
+.guide-num {
+  width: 28px; height: 28px; border-radius: 50%; flex: none; display: grid; place-items: center;
+  background: var(--primary-soft); color: var(--primary-ink); font: 700 12.5px Manrope;
+}
+.guide-step h4 { font-size: 13px; font-weight: 700; color: var(--ink); }
+.guide-step p { font-size: 12.5px; color: var(--ink-3); margin-top: 3px; line-height: 1.5; }
+
+@media (max-width: 1024px) {
+  .whatsapp-setup { grid-template-columns: 1fr; }
+}
+@media (max-width: 640px) {
+  .wa-hero { flex-direction: column; text-align: center; }
+  .wa-refresh { width: 100%; }
+}

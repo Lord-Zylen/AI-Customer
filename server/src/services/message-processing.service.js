@@ -3,6 +3,7 @@ import Customer from '../models/Customer.js';
 import Conversation from '../models/Conversation.js';
 import Message from '../models/Message.js';
 import { generateAiDecision } from './ai.service.js';
+import { addHuman, clearProcessing, currentRateFor, markProcessing, pushInbound } from './redis.service.js';
 
 const NORMALIZE_LEN = 400;
 // Message.content has a mongoose maxlength of 5000, but validation throws
@@ -72,10 +73,22 @@ export async function createConversationRecord({ chatId, name, content, external
 export async function decideInbound({ chatId, name, content, externalId, media = false }) {
   const { customer, conversation, inbound, created, reason } = await createConversationRecord({ chatId, name, content, externalId, media });
   if (!inbound) return { action: 'allow', reason: reason || 'AI decision unavailable; let Hermes handle it.', conversation: null, inbound: null, decision: null };
+  if (created) {
+    await trackInbound(chatId, content, externalId);
+    const rate = await currentRateFor(chatId);
+    if (rate.limited) {
+      conversation.requiresHuman = true;
+      conversation.status = 'HUMAN_REQUIRED';
+      await conversation.save();
+      await addHuman(conversation.id, { chatId, reason: 'RATE_LIMITED', updatedAt: new Date().toISOString() });
+      return { action: 'skip', reason: 'RATE_LIMITED', conversation, inbound, decision: { intent: null, confidence: 0, requiresHuman: true } };
+    }
+  }
   if (!conversation.aiEnabled) {
     conversation.requiresHuman = true;
     conversation.status = 'HUMAN_REQUIRED';
     await conversation.save();
+    await addHuman(conversation.id, { chatId, reason: 'AI_PAUSED', updatedAt: new Date().toISOString() });
     return { action: 'skip', reason: 'AI_PAUSED', conversation, inbound, decision: { intent: null, confidence: 0, requiresHuman: true } };
   }
   let decision = null;
@@ -91,9 +104,17 @@ export async function decideInbound({ chatId, name, content, externalId, media =
     conversation.requiresHuman = true;
     conversation.status = 'HUMAN_REQUIRED';
     await conversation.save();
+    await addHuman(conversation.id, { chatId, reason: decision?.reason || 'HUMAN_REQUIRED', updatedAt: new Date().toISOString() });
     return { action: 'skip', reason: 'HUMAN_REQUIRED', conversation, inbound, decision };
   }
+  if (created) await clearProcessing(externalId);
   return { action: 'allow', reason: 'AI reply permitted by policy.', conversation, inbound, decision };
+}
+
+async function trackInbound(chatId, content, externalId) {
+  const at = new Date().toISOString();
+  await markProcessing(externalId, { chatId, at });
+  await pushInbound({ externalId, chatId, snippet: coerceContent(content).slice(0, 200), at });
 }
 
 export async function recordOutboundAi({ chatId, response, sessionId, intent = null, confidence = null }) {

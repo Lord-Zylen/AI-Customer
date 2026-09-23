@@ -1,156 +1,165 @@
-================================================================================
-Customer AI <-> Hermes <-> WhatsApp — CURRENT AUDIT / BLITZ READINESS
-+ Hermes clone fix: headless-build credential prompt eliminated; repository
-  verified public at the pinned commit
-================================================================================
-Date: 2026-09-23. Mode: static audit + live verification of the exact Git
-operations the Dockerfile performs. Nothing deployed, pushed, SSH'd, paired, or
-messaged. This file is the ONLY current report (operator rule): previous
-versions are replaced, not kept. Secrets never appear here or in the repo.
+===============================================================================
+CURRENT REPORT — Production deployment preparation (Render + Vercel)
+(this file is the only current report; any earlier version is replaced)
+===============================================================================
+LATEST UPDATE (2026-09-23): Repository prepared for production deployment:
+Vercel SPA frontend + single Render Docker web service (Node backend + Hermes
+gateway + WhatsApp bridge) + external MongoDB Atlas + Redis Cloud. Preparation
+ONLY — no business logic, AI/Hermes guardrails, or architecture redesign.
+Nothing deployed. Nothing committed/pushed (HEAD 23a0c49).
 
 ================================================================================
-1. CURRENT STATUS
+1. FILES CHANGED (this task)
 ================================================================================
-Build blocker being addressed: `git clone` of the Hermes agent failed in the
-Blitz Cloud build with
-  fatal: could not read Username for 'https://github.com': No such device or
-  address / fatal: expected flush after ref listing (exit 128).
-Diagnosis: the repo reference itself is CORRECT and PUBLIC. During the failed
-build, GitHub answered the HTTPS ls-remote with an auth-required (404) response
-(repo transiently private/absent at that moment — the repo is actively pushed
-2026-09-23 17:01 UTC), so git tried to prompt for a username; in a headless
-build with no terminal this becomes "could not read Username … No such device
-or address". The Dockerfile is now hardened so the build never attempts an
-interactive credential prompt: it either clones or fails fast (see section 2).
-The exact Git sequence now passes reachability + checkout verification (section
-7). A real `docker build` could not be executed here (no daemon), so image-level
-verification remains with the operator.
+- .env.example                     rewritten as safe Render template (same var
+                                   names; no secrets; CAI_HOOK_BASE_URL optional
+                                   since entrypoint derives it from $PORT)
+- Dockerfile                       Render-targeted: HERMES_HOME=/app/data/hermes,
+                                   WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth,
+                                   removed hardcoded CAI_HOOK_BASE_URL + VOLUME
+                                   (Render disk mounts /app/data), pre-created /
+                                   customerai-owned /app/data paths, Hermes pin
+                                   4716ec0... unchanged, non-root uid 1000 kept
+- deploy/blitz/entrypoint.sh       Render: persists under /app/data, derives
+                                   CAI_HOOK_BASE_URL from $PORT, ownership-aware
+                                   mkdir with fail-fast message on disk problems
+- deploy/blitz/supervisor.mjs      header comment only (behavior unchanged)
+- server/src/server.js             graceful shutdown now closes MongoDB AND Redis
+                                   (SIGTERM/SIGINT); connection string redacted
+                                   in Mongo connect error logs
+- server/src/services/database.service.js  added closeDatabase()
+- docker-compose.yml               rebuilt as local container harness: external
+                                   Atlas+Redis via .env, port 5000:5000,
+                                   persistent named volumes for /app/data/hermes
+                                   + /app/data/whatsapp-auth; removed legacy
+                                   bundled mongo (prod never runs a datastore)
+- render.yaml                      (NEW) Blueprint: Docker web service, health
+                                   check /api/health, persistent disk @ /app/data
+- README.md                        Render + Vercel deployment section added as
+                                   primary; Blitz section demoted to legacy
+- client/.env.example              points VITE_API_URL at Render backend
+
+Also present but from the PREVIOUS task (frontend redesign, uncommitted):
+client/src redesign (AppLayout, pages, CSS), plus earlier fixes
+(redis.service.js, seed.js admin fix, login hardening). All uncommitted.
 
 ================================================================================
-2. ROOT CAUSE
+2. ARCHITECTURE (as prepared)
 ================================================================================
-1. Dockerfile pins HERMES_REPO=https://github.com/NousResearch/hermes-agent.git
-   and HERMES_COMMIT=4716ec0ba4e212105f8f162c226f052b25f8a76b (public repo).
-2. On the failing build, GitHub responded to the anonymous git-over-HTTPS
-   ls-remote with 404 (private/nonexistent at that instant), which git
-   interprets as "authentication required".
-3. With no credential helper and no terminal in the build, git's getpass fails:
-   "could not read Username … No such device or address" -> the RUN aborts
-   (exit 128). This is a credential-PROMPT symptom, not an invalid URL/commit.
-4. Verified NOW: the repo is public (private: false), and the exact sequence
-   clone --no-checkout --depth 1 + fetch --depth 1 <sha> + checkout --detach
-   succeeds, HEAD at 4716ec0 (hermes-agent v0.21.3). The repository was created
-   2025-07-22 and pushed as recently as 2026-09-23 17:01 UTC — consistent with
-   it being made public/available again right before this inspection.
-Conclusion: no secret is required and no secret belongs in the build. The fix is
-to never let git interactively request credentials in the (headless) build, so
-an unavailable/private-again repo fails fast with a clear error instead of the
-confusing fatal, and a public repo clones as it does today.
+Vercel (client/, SPA, vercel.json rewrite) -> VITE_API_URL=https://<render>/api
+  -> Render Docker web service (one container):
+     deploy/blitz/entrypoint.sh -> deploy/blitz/supervisor.mjs
+       1. prepare /app/data paths + idempotent Hermes first-boot seeding
+       2. start Node backend (HOST=0.0.0.0, $PORT from Render)
+       3. wait /api/health == 200 (needs MongoDB reachable, else exit 1)
+       4. start Hermes gateway (spawns WhatsApp Baileys bridge)
+  -> MongoDB Atlas + Redis Cloud (external, never in the container)
+Same container is required because human-queue sends invoke local `hermes send`.
+Hermes remains the only WhatsApp transport owner; /api/whatsapp/* are 409.
 
 ================================================================================
-3. CHANGE MADE
+3. RENDER CONFIG (render.yaml)
 ================================================================================
-File: Dockerfile (only the Hermes clone RUN; URL and commit unchanged).
-                     |  RUN git clone --no-checkout --depth 1 \
-                     |    "${HERMES_REPO}" /opt/hermes-agent \
-                     |  changed to
-  RUN export GIT_TERMINAL_PROMPT=0 \
-      && git clone --no-checkout --depth 1 "${HERMES_REPO}" /opt/hermes-agent \
-      && git -C /opt/hermes-agent fetch --depth 1 origin "${HERMES_COMMIT}" \
-      && git -C /opt/hermes-agent checkout --detach FETCH_HEAD
-Effect: git never reads a username from the (non-)terminal. Public-repo builds
-are unaffected; private/404 cases now abort immediately with the repository
-error instead of hanging on a prompt. No credentials, args, or secrets added.
-Other findings NOT changed (out of scope / not part of this failure):
-  - Legacy docker-compose.yml still points at the pre-Blitz design
-    (port 5000, WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth, native `mongodb`
-    service). The Blitz image persists WhatsApp via the Hermes bridge's
-    SESSION_DIR = $HOME/.hermes/whatsapp/session (resolved by
-    scripts/whatsapp-bridge/bridge.js at the pinned commit) on the
-    VOLUME /home/customerai/.hermes. Persistent WhatsApp auth remains intact;
-    WHATSAPP_AUTH_DIR is a legacy leftover, not referenced by the Blitz image.
+- type: web, runtime: docker, dockerfilePath: ./Dockerfile, dockerContext: .
+- healthCheckPath: /api/health
+- disk: whatsapp-persistent-data, mountPath: /app/data, sizeGB: 1
+- Render injects PORT; image fallback 8080; HOST=0.0.0.0 (ENV)
+- Secrets set ONLY in dashboard (never in render.yaml/.env.example/git)
+- Render shell is used for the one-time WhatsApp pairing (session persists on
+  the /app/data disk; survives restarts)
 
 ================================================================================
-4. WHO INTRODUCED THE CLONE BEHAVIOR
+4. VERCEL CONFIG
 ================================================================================
-Commit ea89ab0 "edit 1" (2026-09-22) replaced the original minimal image
-(FROM node:22-bookworm-slim AS production; no Hermes; USER node; EXPOSE 5000;
-mkdir /app/data/whatsapp-auth) with the Blitz/uid-1000 image that clones
-NousResearch/hermes-agent at the pinned commit and installs via uv. The URL and
-pinned commit are correct and public; the clone-stage failure is environmental
-(repo availability at build time), not the URL or the commit. No commit is
-deleted or rewritten; the fix is configuration hardening on top of ea89ab0.
+- Root Directory: client; Build: npm run build; Output: dist
+- Env: VITE_API_URL=https://<render-backend-public-url>/api (public, build-time)
+- client/vercel.json keeps the SPA rewrite (paths -> /index.html); frontend only
 
 ================================================================================
-5. WHAT WAS VERIFIED
+5. ENVIRONMENT VARIABLE CHECKLIST (names ONLY — set real values in Render/Vercel)
 ================================================================================
-PASS — HTTPS API: GET /repos/NousResearch/hermes-agent -> HTTP 200,
-  private: false, default branch main, created 2025-07-22,
-  pushed 2026-09-23 17:01:33Z.
-PASS — GET /repos/.../commits/4716ec0ba4e212105f8f162c226f052b25f8a76b ->
-  HTTP 200 (commit exists).
-PASS — git ls-remote https://github.com/NousResearch/hermes-agent.git
-  (GIT_TERMINAL_PROMPT=0) returns refs without credentials.
-PASS — EXACT Dockerfile sequence (GIT_TERMINAL_PROMPT=0):
-  git clone --no-checkout --depth 1 <repo> /opt/hermes-agent
-  git -C fetch --depth 1 origin 4716ec0ba4e212105f8f162c226f052b25f8a76b
-  git -C checkout --detach FETCH_HEAD
-  -> HEAD=4716ec0ba4e212105f8f162c226f052b25f8a76b.
-PASS — Final-tree contents needed by the Dockerfile at the pinned commit:
-  hermes_cli/main.py (gateway "python -m hermes_cli.main"), hermes entry script,
-  pyproject name="hermes-agent" version="0.21.3" requires-python=">=3.11,<3.14",
-  uv.lock, scripts/whatsapp-bridge/bridge.js + package.json (npm ci), gateway/
-  config_env.py. All present.
-PASS — hadolint on the modified Dockerfile: no parse errors; only pre-existing
-  DL3008 (apt pin) and DL4006 (pipefail) warnings plus an informational DL3059.
-PASS — docker compose config parses (offline); the legacy compose references
-  /app/data/whatsapp-auth which the pre-Blitz image used.
-PASS — git diff --check clean; only the intended Dockerfile lines changed.
-NOT RUN — real `docker build` / in-container Hermes startup: Docker daemon
-  socket is root:docker with no docker group and no passwordless sudo; an actual
-  build must run on a machine with a daemon (the operator's build host / Blitz).
+Backend + Hermes (Render service env):
+NODE_ENV, HOST, PORT (Render-reserved, auto), TRUST_PROXY, MONGODB_URI,
+REDIS_URL, REDIS_QUEUE_TTL, REDIS_PROCESSING_TTL, REDIS_HUMAN_TTL,
+REDIS_RATE_LIMIT, REDIS_RATE_WINDOW_SEC, SESSION_SECRET, AI_API_KEY, AI_MODEL,
+AI_CONFIDENCE_THRESHOLD, HERMES_ENABLED, HERMES_HOME, HERMES_GATEWAY_STATE,
+HERMES_BIN, HERMES_STATE_STALE_MS, WHATSAPP_AUTH_DIR, CAI_HOOK_SECRET,
+CAI_HOOK_BASE_URL (optional; derived from $PORT), CLIENT_ORIGIN, ADMIN_EMAIL,
+ADMIN_PASSWORD, SEED_PRINT_CREDENTIALS, SEED_DEMO, WHATSAPP_SETUP_TOKEN,
+GROQ_API_KEY, WHATSAPP_ENABLED, WHATSAPP_ALLOW_ALL_USERS, WHATSAPP_ALLOWED_USERS,
+WHATSAPP_HOME_CHANNEL
+Vercel: VITE_API_URL
 
 ================================================================================
-6. SECRETS / SECURITY
+6. PERSISTENT STORAGE (confirmation)
 ================================================================================
-PASS — no GitHub token/username/SSH key anywhere (git grep HERMES_REPO/COMMIT
-  show only the Dockerfile public URL + commit; .dockerignore excludes .env and
-  sessions; .env.example has placeholders only; .env not committed).
-PASS — the solution requires NO new secret; Blitz needs no Git credential for a
-  public repo.
+- Render Persistent Disk mounts at /app/data (render.yaml disk.mountPath)
+- $HERMES_HOME=/app/data/hermes  -> Hermes config/state/logs & pairing/session
+- $WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth
+- Old Blitz path /home/customerai/.hermes fully replaced; anonymous VOLUME removed
+- On an empty disk the entrypoint seeds config.yaml, customer-ai-gate plugin and
+  customer_ai_tap hook once (idempotent); live dev ~/.hermes is never copied in
+- Disk is NOT backed up by Render -> export it for redundancy
 
 ================================================================================
-7. WHAT REMAINS FOR BLITZ CLOUD
+7. TEST MATRIX
 ================================================================================
-- None required for Git: the repo is public; the build clones anonymously.
-- If a future build still 404s on github.com, check Blitz's egress/DNS and the
-  repo visibility (make public or re-verify), NOT credentials.
-- WhatsApp persistence on Blitz: the /home/customerai/.hermes volume must be
-  attached (bridge session dir resolves to $HOME/.hermes/whatsapp/session).
-- Operator rebuild:  docker build --platform linux/amd64 -t customer-ai-blitz:test .
-- If the repository is ever required to be private, do NOT add tokens to the
-  Dockerfile; use a Blitz build secret / GitHub deploy key mounted at build
-  time without baking it into image layers or IRC history.
+PASS  node --check: server.js, database.service.js, redis.service.js,
+      whatsapp.service.js, routes (system/auth/hermes/whatsapp), seed.js
+PASS  bash -n deploy/blitz/entrypoint.sh
+PASS  docker compose config -q (client-side validation)
+PASS  render.yaml YAML parse (PyYAML)
+PASS  client `vite build` (1903 modules, 326 kB JS / 36 kB CSS gzip'd)
+PASS  Local production-mode boot (NODE_ENV=production, port 5056) against REAL
+      Atlas + Redis Cloud: /api/health -> 200 {"mongodb":"CONNECTED",
+      "redis":"CONNECTED"}; /api/system/status -> backend/mongodb/redis CONNECTED,
+      groq CONFIGURED, hermes+whatsapp CONNECTED (real local gateway running);
+      POST /api/auth/login -> 200 with valid JWT (credentials verified, not printed)
+PASS  Fresh-disk behaviour: HERMES_HOME pointed at an empty dir ->
+      /api/system/status still 200, hermes/whatsapp "NOT CONNECTED", backend/
+      mongodb/redis CONNECTED (graceful degradation, as on first Render boot)
+PASS  CAI_HOOK_BASE_URL derivation: PORT=10000 -> http://127.0.0.1:10000;
+      explicit env value wins
+PASS  Redaction: Mongo connect errors strip user:pass from connection strings
+PASS  Security: rg over tracked files shows no API keys/private keys; .gitignore
+      covers .env/.env.* (exceptions: examples); .dockerignore excludes .env* and
+      local sessions; no secret values in .env.example/render.yaml
+NOT TESTED  docker build/test-run in THIS environment: daemon unreachable
+      (permission denied on /var/run/docker.sock, uid 1000, no passwordless
+      sudo). The Dockerfile/compose are validated syntactically; the image build
+      must be run by the user (see #9) or in CI.
+NOT TESTED  Real Render deploy + WhatsApp pairing on Render (requires account)
 
 ================================================================================
-8. EXACT NEXT STEP (operator)
+8. BLOCKERS / RISKS
 ================================================================================
-  1) docker build --platform linux/amd64 -t customer-ai-blitz:test .  (daemon host)
-  2) docker run --rm --platform linux/amd64 --user 1000:1000 --cap-drop ALL \
-     --security-opt no-new-privileges -p 8080:8080 \
-     -v customer-ai-test:/home/customerai/.hermes \
-     -e NODE_ENV=production -e HOST=0.0.0.0 -e PORT=8080 -e TRUST_PROXY=1 \
-     -e MONGODB_URI=<atlas-uri> \
-     -e HERMES_HOME=/home/customerai/.hermes -e HERMES_ENABLED=false \
-     customer-ai-blitz:test
-  3) curl -s -i http://127.0.0.1:8080/api/health   (expect 200)
-  4) With HERMES_ENABLED=true: verify gateway starts from the cloned tree
-     (/opt/hermes-agent/venv/bin/python -m hermes_cli.main gateway run),
-     bridge starts, session dir resolves under the volume, no permission errors.
-  5) Persistence probe: restart the container on the same volume -> WhatsApp
-     session survives.
-Do NOT pair WhatsApp or send messages during checks.
+- Docker daemon unavailable in this workspace -> Docker build not executable here
+- Render persistent-disk file ownership at first mount: entrypoint fails fast with
+  an explicit message if /app/data is not writable by uid 1000; fix ownership if
+  it happens (only affects first provisioning)
+- Dev backend on 127.0.0.1:5000 was NOT running at report time (the local Hermes
+  gateway/bridge still is). Pre-existed this task; restart with `npm run dev` to
+  resume local development. Not auto-restarted here.
+- No browser in this environment -> visual/E2E check of the built SPA still manual
+- sed_masked MONGODB_URI dump earlier showed part of the Atlas URI in shell
+  output; it is a real secret - rotate if concerned (credentials live only in .env)
 
 ================================================================================
-END OF REPORT — this is the only current report; any earlier version is replaced
+9. DEPLOYMENT ORDER (manual)
+================================================================================
+1. Set secrets in Render: MONGODB_URI, REDIS_URL, SESSION_SECRET, AI_API_KEY,
+   GROQ_API_KEY, CAI_HOOK_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD, CLIENT_ORIGIN
+   (CLIENT_ORIGIN=https://<vercel-domain>, set after Vercel deploy if needed)
+2. Deploy via render.yaml Blueprint (or Docker service): root repo, Persistent
+   Disk mounted at /app/data. Confirm container boots to healthy (/api/health).
+3. Render shell: pair WhatsApp via `hermes gateway` flow -> verify session dir
+   appears under /app/data/hermes/whatsapp.
+4. Send a real WhatsApp message; confirm gate allows + AI reply + human-queue
+   route.
+5. Deploy Vercel: root client, VITE_API_URL=https://<render>/api, build+output
+   as in #4.
+6. Set/confirm CLIENT_ORIGIN and CORS; smoke-test dashboard, conversations,
+   human-queue reply (hermes send), settings.
+7. (Optional) docker build -t customer-ai-render:test . locally/CI and confirm
+   HEALTHCHECK + supervisor logs ([backend]/[hermes]/[supervisor]).
 ================================================================================

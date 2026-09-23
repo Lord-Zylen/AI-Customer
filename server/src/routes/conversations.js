@@ -4,6 +4,7 @@ import Message from '../models/Message.js';
 import { requireAuth } from '../middleware/auth.js';
 import { sendWhatsAppMessage } from '../services/whatsapp.service.js';
 import { humanOutboundDedupeKey } from '../services/message-processing.service.js';
+import { addHuman, removeHuman } from '../services/redis.service.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -41,6 +42,11 @@ router.patch('/:id', async (req, res, next) => {
     if (patch.aiEnabled === false) { patch.requiresHuman = true; patch.status = 'HUMAN_REQUIRED'; }
     const item = await Conversation.findByIdAndUpdate(req.params.id, patch, { new: true, runValidators: true }).populate('customerId', 'name phone');
     if (!item) return res.status(404).json({ error: { message: 'Conversation not found.' } });
+    if (item.requiresHuman && item.status !== 'RESOLVED') {
+      await addHuman(item.id, { chatId: item.customerId?.phone || '', reason: 'MANUAL', updatedAt: new Date().toISOString() });
+    } else {
+      await removeHuman(item.id);
+    }
     res.json(item);
   } catch (e) { next(e); }
 });
@@ -105,6 +111,7 @@ router.post('/:id/messages', async (req, res, next) => {
     conversation.requiresHuman = false;
     conversation.status = 'OPEN';
     await conversation.save();
+    await removeHuman(conversation.id);
     res.status(201).json(message);
   } catch (e) { next(e); }
 });
