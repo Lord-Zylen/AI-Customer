@@ -63,7 +63,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Pinned Hermes core into /opt/hermes-agent (the read-only-ish install tree:
 # Hermes mirrors nothing here at runtime except the writable bridge dir).
-RUN git clone --no-checkout --depth 1 "${HERMES_REPO}" /opt/hermes-agent \
+RUN export GIT_TERMINAL_PROMPT=0 \
+    && git clone --no-checkout --depth 1 "${HERMES_REPO}" /opt/hermes-agent \
     && git -C /opt/hermes-agent fetch --depth 1 origin "${HERMES_COMMIT}" \
     && git -C /opt/hermes-agent checkout --detach FETCH_HEAD
 
