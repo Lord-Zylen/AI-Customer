@@ -1,0 +1,32 @@
+# ============================================================================
+# Customer AI — Render Blueprint (deployment-as-code)
+#
+# Deploy with "New + > Blueprint" pointing at this repository, then set the
+# SECRETS in the Render dashboard (never put them in this file):
+#   MONGODB_URI, REDIS_URL, SESSION_SECRET, AI_API_KEY, GROQ_API_KEY,
+#   CAI_HOOK_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD, CLIENT_ORIGIN
+# Defaults (NODE_ENV/HOST/PORT/TRUST_PROXY/HERMES_*/WHATSAPP_*/AI_MODEL/
+# AI_CONFIDENCE_THRESHOLD/REDIS_*/SEED_*) are already baked into the image or
+# .env.example — override only when needed.
+#
+# The container listens on Render's reserved PORT env (image fallback 8080).
+# Render routing uses EXPOSE 8080; health checks hit /api/health.
+# ============================================================================
+
+services:
+  - type: web
+    name: customer-ai-backend
+    runtime: docker
+    # For Blueprint deploys this must be the actual Git remote, e.g.
+    # https://github.com/<account>/AI-Customer
+    repo: https://github.com/<account>/AI-Customer
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    region: oregon
+    plan: starter
+    healthCheckPath: /api/health
+    autoDeploy: true
+    disk:
+      name: whatsapp-persistent-data
+      mountPath: /app/data
+      sizeGB: 1

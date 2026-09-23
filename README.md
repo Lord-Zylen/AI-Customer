@@ -21,9 +21,62 @@ WhatsApp → Hermes bridge → customer-ai-gate → POST /api/hermes/webhook/gat
 Human queue reply → POST /api/conversations/:id/messages → `hermes send --to whatsapp:<jid>`
 ```
 
-## Blitz Cloud Deployment
+## Production Deployment (Render + Vercel)
 
-Blitz Cloud is the **primary** deployment target. The frontend is served by Vercel; a single Blitz Cloud container runs the Node backend **plus** the Hermes gateway **plus** the WhatsApp bridge; MongoDB stays on Atlas.
+The **primary** deployment target is Render (+ Vercel for the frontend). The frontend is served by Vercel; a single Render Docker web service runs the Node backend **plus** the Hermes gateway **plus** the WhatsApp bridge. MongoDB stays on Atlas; Redis stays on Redis Cloud — no datastore is installed in the container.
+
+### A. Architecture
+
+```
+            ┌──────────────┐
+            │    Vercel    │   React frontend (client/), SPA rewrites via vercel.json
+            └──────┬───────┘
+                   │ HTTPS (VITE_API_URL=https://<render-url>/api)
+                   ▼
+        ┌───────────────────────────┐
+        │       Render web          │  one container (port = Render's PORT env)
+        │  Customer AI (Node)       │
+        │     ├ Hermes Gateway      │
+        │     │   └ WhatsApp bridge │
+        │     └ Persistent Disk     │  mounted at /app/data
+        └─────────────┬─────────────┘
+                      ▼
+          MongoDB Atlas + Redis Cloud (external)
+```
+
+Hermes remains the **only** WhatsApp transport owner. Customer AI and Hermes must share the same container because the human-queue send path invokes the local Hermes CLI (`hermes send`).
+
+### B. Deploy
+
+- **Render**: use `render.yaml` (Blueprint) or create a manual **Docker** web service: Root Directory `/` (repo root), `Dockerfile`. Create a **Persistent Disk** and mount it at **`/app/data`** (this persists the Hermes home and the WhatsApp auth — losing it can require re-pairing WhatsApp).
+- **Vercel**: Root Directory `client`, build `npm run build`, output `dist`, env `VITE_API_URL=https://<render-backend-public-url>/api`. `client/vercel.json` keeps the SPA rewrite working. No serverless functions; frontend only.
+
+### C. Environment variables (set in the Render dashboard — names only, values never in git)
+
+- Backend: `NODE_ENV`, `HOST` (`0.0.0.0`), `PORT` (set by Render, do not configure), `TRUST_PROXY`, `MONGODB_URI`, `REDIS_URL`, `SESSION_SECRET`, `AI_API_KEY`, `AI_MODEL`, `AI_CONFIDENCE_THRESHOLD`, `HERMES_ENABLED`, `HERMES_HOME`, `HERMES_GATEWAY_STATE`, `HERMES_BIN`, `HERMES_STATE_STALE_MS`, `WHATSAPP_AUTH_DIR`, `CAI_HOOK_SECRET`, `CAI_HOOK_BASE_URL`, `CLIENT_ORIGIN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `SEED_PRINT_CREDENTIALS`, `WHATSAPP_SETUP_TOKEN`
+- Hermes (same container): `GROQ_API_KEY`, `WHATSAPP_ENABLED`, `WHATSAPP_ALLOW_ALL_USERS`, `WHATSAPP_ALLOWED_USERS`, `WHATSAPP_HOME_CHANNEL`
+
+`CAI_HOOK_BASE_URL` is optional: the container entrypoint derives `http://127.0.0.1:<PORT>` from Render's dynamic `PORT` when unset. See `.env.example` for the commented template.
+
+### D. Persistent storage
+
+The Render Persistent Disk mounts at **`/app/data`**. The image writes `$HERMES_HOME` (`/app/data/hermes`) and `$WHATSAPP_AUTH_DIR` (`/app/data/whatsapp-auth`) there. Render disks are not backed up — copy the volume externally if you need redundancy. First-boot seeding of `config.yaml`, the `customer-ai-gate` plugin and the `customer_ai_tap` hook is idempotent and only happens on an empty disk. Never copy the developer's local WhatsApp session into the image.
+
+### E. Initial WhatsApp pairing
+
+Hermes pairing runs from the container shell (Render exposes a shell in the service details). After pairing, the session lives under `$HERMES_HOME` on the persistent disk and survives restarts. Never expose the QR via an unauthenticated HTTP endpoint; the `/api/whatsapp/*` routes remain `409 "managed by Hermes"` and are not used for pairing.
+
+### F. Health / secrets / logs
+
+- Health: `GET /api/health` (`/api/health` on Render). DB-backed: returns `200` only when MongoDB is reachable; independent of WhatsApp connection state. Configure the Render health check to this path.
+- Secrets: `MONGODB_URI`, `REDIS_URL`, `SESSION_SECRET`, `AI_API_KEY`, `GROQ_API_KEY`, `CAI_HOOK_SECRET`, `WHATSAPP_SETUP_TOKEN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD` in Render only. `CAI_HOOK_SECRET` must be identical for backend and Hermes (same container environment).
+- CORS: set `CLIENT_ORIGIN=https://<vercel-domain>` (comma-separated for more). No-Origin requests (internal webhooks) keep working.
+- Logs: prefixed `[supervisor]`, `[backend]`, `[hermes]` lines; connection strings are redacted in error logs; message contents are never logged.
+- Fail-fast: if the persistent disk can't be mounted at `/app/data` or MongoDB is unreachable at boot, the supervisor exits non-zero so Render restarts and the logs state the cause.
+
+## Legacy: Blitz Cloud deployment (superseded)
+
+Blitz Cloud was the earlier deployment target. The sections below document that layout and its assumptions; the current target is **Render + Vercel** (see above). Keep the two methods separate.
 
 ### A. Architecture
 

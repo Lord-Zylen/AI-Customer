@@ -1,28 +1,31 @@
+# Local-development container harness for the Customer AI image.
+#
+# PRODUCTION does NOT use this file: Render runs the Dockerfile directly and
+# MongoDB (Atlas) + Redis (Redis Cloud) stay external. Do not add a local
+# MongoDB/Redis container to production — the backend never runs a datastore.
+#
+# For a quick local container smoke test, point this at the SAME external
+# services the app already uses (values come from .env: MONGODB_URI, REDIS_URL).
+#   docker compose up --build
+#   curl http://localhost:5000/api/health
 services:
   customer-ai:
     build: .
     restart: unless-stopped
     env_file: .env
     environment:
-      MONGODB_URI: mongodb://mongodb:27017/customer_ai
-      WHATSAPP_AUTH_DIR: /app/data/whatsapp-auth
+      # Match the container's listener to the published port below.
+      PORT: "5000"
+      # External infra is used (MONGODB_URI / REDIS_URL come from .env).
+      # The optional entrypoint derives CAI_HOOK_BASE_URL from PORT.
     ports:
       - "5000:5000"
     volumes:
+      # WhatsApp/Hermes persistence must SURVIVE restarts — keep these named
+      # volumes so a container rebuild does not force re-pairing.
+      - hermes_data:/app/data/hermes
       - whatsapp_auth:/app/data/whatsapp-auth
-    depends_on:
-      mongodb:
-        condition: service_healthy
-  mongodb:
-    image: mongo:8
-    restart: unless-stopped
-    volumes:
-      - mongo_data:/data/db
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
+
 volumes:
-  mongo_data:
+  hermes_data:
   whatsapp_auth:
