@@ -58,7 +58,7 @@ ENV PATH=/home/customerai/.local/bin:/opt/hermes-agent/venv/bin:/usr/local/sbin:
 # System deps: Python 3.11 (Hermes venv, requires-python >=3.11,<3.14),
 # git + curl (pinned Hermes checkout, uv installer), passwd (usermod/groupmod).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3 python3-venv python3-ensurepip git curl ca-certificates passwd \
+      python3 python3-venv git curl ca-certificates passwd \
     && rm -rf /var/lib/apt/lists/*
 
 # Pinned Hermes core into /opt/hermes-agent (the read-only-ish install tree:
