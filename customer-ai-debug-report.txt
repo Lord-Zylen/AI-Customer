@@ -267,7 +267,7 @@ PASS (static) — .env.example separates:
      WHATSAPP_ALLOW_ALL_USERS (consumed by gateway run.py startup safety check),
      WHATSAPP_HOME_CHANNEL
   D) Blitz: HOST=0.0.0.0, PORT=8080 (also Dockerfile ENV defaults)
-  E) Frontend/Vercel: VITE_API_URL (client/.env.example; ends with /api)
+  E) Frontend/Vercel: VITE_API_URL (cldocker editient/.env.example; ends with /api)
   F) Optional: CLIENT_ORIGIN (default localhost:5173 in code), GROQ_API_KEY,
      WHATSAPP_SETUP_TOKEN (legacy 409 routes)
 PASS (static) — naming is consistent across .env.example, server.js,

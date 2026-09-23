@@ -5,3 +5,4 @@ node_modules
 !client/.env.example
 dist
 data/whatsapp-auth
+customer-ai-debug-report.txt
