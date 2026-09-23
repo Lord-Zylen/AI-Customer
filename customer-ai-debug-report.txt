@@ -1,6 +1,7 @@
 ================================================================================
 Customer AI <-> Hermes <-> WhatsApp — CURRENT STATIC AUDIT / BLITZ READINESS
-+ Docker build fix (Debian Bookworm: python3-ensurepip package does not exist)
++ Docker build fixes: (1) Bookworm has no python3-ensurepip package;
+  (2) root-owned /home/customerai/.npm broke the uid-1000 npm cache (EACCES)
 ================================================================================
 Date: 2026-09-23. Mode: static audit only. Nothing deployed, pushed, SSH'd,
 paired, or messaged.
@@ -15,8 +16,14 @@ Repository is in a clean, deployment-ready static state for Blitz Cloud:
 Dockerfile (uid/gid 1000, port 8080, empty VOLUME at /home/customerai/.hermes,
 non-root, no Nginx/systemd), entrypoint + Node supervisor, seeded sanitized
 Hermes config/plugin/hook, backend + Hermes + bridge all wired to one container,
-Vercel frontend only. The one known Docker build blocker (python3-ensurepip,
-which does not exist in Debian Bookworm) was removed from the apt install line.
+Vercel frontend only. Both known Docker build blockers are fixed:
+  (1) python3-ensurepip (does not exist in Debian Bookworm) — removed from the
+      apt install line.
+  (2) root-owned /home/customerai/.npm — the root `npm ci --omit=dev` ran with
+      HOME=/home/customerai and created the cache as root, so the later
+      customerai (uid 1000) `npm ci --prefix` for the WhatsApp bridge failed
+      with EACCES. Ownership is now restored before the first uid-1000 npm step
+      (see section 3).
 Docker build/run STILL could NOT be executed (no daemon access), so everything
 that requires the container remains explicitly UNVERIFIED.
 
@@ -25,39 +32,88 @@ that requires the container remains explicitly UNVERIFIED.
 ================================================================================
 - Dockerfile: removed `python3-ensurepip` from the apt install line — the
   package does not exist in Debian Bookworm and broke `docker build` at the apt
-  step (the original failure point). Committed alone as e2b6540.
+  step. Committed alone as e2b6540.
+- Dockerfile: added `RUN chown -R customerai:customerai /home/customerai`
+  immediately after the backend `RUN npm ci --omit=dev` and before `USER
+  customerai`. Restores uid/gid-1000 ownership of the home dir that the
+  root-run npm step had clobbered with its uid-0 cache directory
+  (/home/customerai/.npm). One line; committed with this report.
 - Dockerfile: added note that /api/health is DB-backed, so the backend-only
-  smoke run needs -e MONGODB_URI=<atlas-uri> (without it the health check 503s
-  and the supervisor exits after the wait — correct fail-fast, now documented).
+  smoke run needs -e MONGODB_URI=<atlas-uri> (documented fail-fast behavior).
 - README section K: documented the same MONGODB_URI requirement for /api/health.
 - hermes/: removed __pycache__ / *.pyc artifacts created by an earlier audit's
-  py_compile run (git hygiene). No source changes.
+  py_compile run (git hygiene).
 No application, gate, WhatsApp-ownership, or frontend behavior changed.
 
 ================================================================================
-3. DOCKER BUILD FIX — VERIFICATION (python3-ensurepip)
+3. DOCKER BUILD FIX 1 — python3-ensurepip (previous, still in place)
 ================================================================================
-PASS (static) — confirmed against the live Debian Bookworm package index
+PASS (static) — verified against the live Debian Bookworm package index
   (deb.debian.org dists/bookworm/main, binary-amd64 Packages):
-    - python3-ensurepip       ABSENT      <- exact cause of the apt failure
-    - python3, python3-venv, git, curl, ca-certificates, passwd   all PRESENT
+    - python3-ensurepip   ABSENT       <- exact cause of the apt failure
+    - python3, python3-venv, git, curl, ca-certificates, passwd  all PRESENT
 PASS (static) — python3-venv still provides working venvs without ensurepip:
   it Depends on python3.11-venv, which bundles ensurepip and pulls
-  python3-pip-whl + python3-setuptools-whl (so even pip inside a venv works);
-  python3.11-distutils is satisfied via python3-distutils' Provides.
-PASS (static) — Hermes needs no apt ensurepip: its venv is built by
-  `uv venv --python 3.11` + `uv sync --extra all --locked` (uv manages the
-  Python/build itself); grep confirms no `pip install`, `python -m pip`, or
-  `ensurepip` invocation anywhere in the repo; the gateway/supervisor only use
-  /opt/hermes-agent/venv/bin/python.
+  python3-pip-whl + python3-setuptools-whl; python3.11-distutils is satisfied
+  via python3-distutils' Provides.
+PASS (static) — Hermes needs no apt ensurepip: venv built by
+  `uv venv --python 3.11` + `uv sync --extra all --locked`; grep confirms no
+  `pip install` / `python -m pip` / `ensurepip` invocation anywhere in the repo.
 PASS (static) — simulated apt dependency resolution of the fixed install line:
   84 packages (incl. transitive deps) resolve with no unresolved dependency.
-PASS (static) — Dockerfile parses cleanly under hadolint (only two pre-existing
-  style warnings: DL3008 apt version pinning, DL4006 pipefail).
-UNVERIFIED — actual `docker build` (daemon inaccessible; see section 14).
 
 ================================================================================
-4. UID/GID VERIFICATION
+4. DOCKER BUILD FIX 2 — root-owned /home/customerai/.npm cache (EACCES)
+================================================================================
+Root cause chain (static analysis of the Dockerfile instruction sequence):
+  - ENV HOME=/home/customerai (line 48) applies to EVERY later step, including
+    those that still run as root.
+  - The backend `RUN npm ci --omit=dev` runs as ROOT (USER customerai only
+    comes later), so npm creates its cache at $HOME/.npm =
+    /home/customerai/.npm OWNED BY UID 0.
+  - The earlier `chown -R customerai:customerai ... /home/customerai` happens
+    BEFORE that npm step, so it cannot protect the cache directory.
+  - The WhatsApp-bridge `RUN npm ci --prefix
+    /opt/hermes-agent/scripts/whatsapp-bridge` is the FIRST npm command that
+    runs as customerai (uid/gid 1000); npm tries to open a root-owned cache
+    tmp file -> EACCES (-13), aborting the build (the reported "step #27").
+Fix applied (one line, Dockerfile line 99):
+    RUN chown -R customerai:customerai /home/customerai
+  placed between the root `npm ci --omit=dev` and `USER customerai`, so the
+  home dir (including any root-created cache) is uid/gid-1000 before any
+  customerai npm/uv/launcher step touches it.
+Why safe for the uid/gid-1000 design:
+  - Re-establishes the ownership the Dockerfile already declares (lines 85-94);
+    it only removes uid-0 leftovers that npm created at build time.
+  - Runs at BUILD time, as root build context only; the FINAL runtime remains
+    `--user 1000:1000 --cap-drop ALL --security-opt no-new-privileges` — no
+    sudo, no root container, no world-writable home, no persistence change.
+  - The persistent volume /home/customerai/.hermes and its sealing on first
+    boot are untouched; uid 1000 still owns /home/customerai at runtime.
+  - Hermes venv/uv, bridge npm deps, backend node_modules (root-owned, read-only
+    at runtime), entrypoint, supervisor, and healthcheck are unchanged.
+Other root-owned npm cache locations checked:
+  - Stage 1 (client-build): `npm ci` and `npm run build` run as root with
+    HOME=/root (no ENV HOME override in that stage) -> cache at /root/.npm.
+    That stage terminates after COPY --from; nothing runs as uid 1000 there.
+    NOT a problem.
+  - Stage 2: the ONLY root npm step is `npm ci --omit=dev`; its cache,
+    /home/customerai/.npm, is the one fixed. The bridge npm step runs as uid
+    1000 and now uses a uid-1000 cache.
+  - node-gyp/native-build cache (~/.node-gyp): no native deps — server and
+    client package.json are pure-JS (bcryptjs, mongoose, groq-sdk, vite, react,
+    no node-gyp/better-sqlite3/sharp/bcrypt/etc.), and the chown -R also covers
+    ~/.node-gyp should it ever appear.
+  - No other cache dirs: uv runs as customerai (-> ~/.cache/uv), and the
+    launcher printf runs as customerai. Nothing else writes to home as root.
+PASS (static) — Dockerfile still parses under hadolint: no syntax errors; only
+  DL3008 (apt pin) + DL4006 (pipefail) warnings (pre-existing) and one
+  informational DL3059 suggesting RUN consolidation (kept separate on purpose so
+  the root-npm layer and the ownership-fix layer remain independently cached).
+UNVERIFIED — actual `docker build` (daemon inaccessible; see section 16).
+
+================================================================================
+5. UID/GID VERIFICATION
 ================================================================================
 PASS (static) — Dockerfile renames the Node base image's built-in uid/gid-1000
   user (`node`) to `customerai`, moves HOME to /home/customerai, renames group
@@ -67,14 +123,15 @@ PASS (static) — Dockerfile renames the Node base image's built-in uid/gid-1000
 PASS (static) — no remaining UID 10001 reference anywhere (grep clean on
   Dockerfile/README/env/server/hermes).
 PASS (static) — no runtime sudo; no runtime chown (ownership fixed at build);
-  no setuid/no-new-privileges dependency; container designed for
+  no setuid/no-new-privileges dependency; the NEW chown is build-time only and
+  does not add a runtime root requirement. Container designed for
   `--user 1000:1000 --cap-drop ALL --security-opt no-new-privileges`.
 UNVERIFIED — actual build/runtime under `--user 1000:1000` (no Docker daemon).
 USER, HOME, group, ownership are internally consistent (usermod/groupmod apply
 before any chown/COPY --chown; all paths then use customerai).
 
 ================================================================================
-5. RUNTIME WRITE-PATH AUDIT
+6. RUNTIME WRITE-PATH AUDIT
 ================================================================================
 PASS (static) — every runtime writable location resolves to owner uid 1000 or a
   world-writable tmp; none requires root:
@@ -90,6 +147,8 @@ PASS (static) — every runtime writable location resolves to owner uid 1000 or 
     /home/customerai/.local        customerai-owned (launcher + uv cache from
                                    build). Runtime reads only; no persistence.
     /home/customerai/.local/bin    contains the `hermes` launcher (uid 1000 +x).
+    /home/customerai/.npm          npm cache — customerai-owned after fix 2;
+                                   build-time only. No persistence needed.
     /opt/hermes-agent              customerai-owned (install tree, read-only-ish).
                                    GATEWAY PYTHON venv + hermes package here;
                                    bridge dir writable so whatsapp_common.py
@@ -114,7 +173,7 @@ NOTE — gateway state/logs/pending live under $HERMES_HOME
   (/home/customerai/.hermes), confirmed against Hermes get_hermes_home().
 
 ================================================================================
-6. HERMES CLI AUDIT
+7. HERMES CLI AUDIT
 ================================================================================
 PASS (static) — the Dockerfile creates /home/customerai/.local/bin/hermes:
   `exec /opt/hermes-agent/venv/bin/python /opt/hermes-agent/hermes "$@"`
@@ -133,7 +192,7 @@ UNVERIFIED — in-container execution of `hermes send` / `gateway pair` and
   launcher invocation (needs a build).
 
 ================================================================================
-7. HERMES CONFIG/PLUGIN/HOOK AUDIT
+8. HERMES CONFIG/PLUGIN/HOOK AUDIT
 ================================================================================
 PASS (static) — hermes/configuration/config.yaml is a SANITIZED template: no API
   keys, no passwords, no session, no real WhatsApp JID (placeholders
@@ -158,7 +217,7 @@ Architecture: Vercel -> Customer AI+Hermes+bridge container -> WhatsApp;
 MongoDB Atlas stays external (no mongod in the image, no localhost DB assumption).
 
 ================================================================================
-8. BLITZ NETWORK/PORT AUDIT
+9. BLITZ NETWORK/PORT AUDIT
 ================================================================================
 PASS (static) — Dockerfile ENV HOST=0.0.0.0, PORT=8080; EXPOSE 8080.
 PASS (static) — server.js binds `app.listen(PORT||5000, HOST||'127.0.0.1')` —
@@ -166,14 +225,14 @@ PASS (static) — server.js binds `app.listen(PORT||5000, HOST||'127.0.0.1')` �
   other localhost:5000 is the Vite dev proxy (dev-only).
 PASS (static) — no Nginx dependency, no systemd dependency anywhere in the
   container path; supervisor assumes container PID-1 semantics.
-UNVERIFIED — actual ingress routing on the Blitz platform (see section 16).
+UNVERIFIED — actual ingress routing on the Blitz platform (see section 17).
 
 ================================================================================
-9. PERSISTENCE/VOLUME AUDIT
+10. PERSISTENCE/VOLUME AUDIT
 ================================================================================
 PASS (static) — Dockerfile declares `VOLUME ["/home/customerai/.hermes"]`.
 PASS (static) — all Hermes runtime state that must survive restarts is under
-  $HERMES_HOME (see section 5), confirmed against Hermes get_hermes_home() and
+  $HERMES_HOME (see section 6), confirmed against Hermes get_hermes_home() and
   the bridge's SESSION_DIR/IMAGE_CACHE_DIR defaults. Nothing outside needs
   persistence.
 PASS (static) — the image ships an EMPTY Hermes home; .dockerignore excludes
@@ -181,7 +240,7 @@ PASS (static) — the image ships an EMPTY Hermes home; .dockerignore excludes
   whatsapp-session, data/ — the local developer home cannot reach the image.
 
 ================================================================================
-10. SUPERVISOR/ENTRYPOINT AUDIT
+11. SUPERVISOR/ENTRYPOINT AUDIT
 ================================================================================
 PASS (static) — startup order: entrypoint seeds HERMES_HOME (config/plugin/hook,
   idempotent first-boot-only) and creates runtime dirs, then execs the Node
@@ -195,7 +254,7 @@ PASS (static) — cwd/env correct: backend cwd /app/server; gateway cwd
 UNVERIFIED — runtime behavior in-container (build required).
 
 ================================================================================
-11. ENVIRONMENT VARIABLE AUDIT
+12. ENVIRONMENT VARIABLE AUDIT
 ================================================================================
 PASS (static) — .env.example separates:
   A) Customer AI: NODE_ENV, HOST, PORT, TRUST_PROXY, MONGODB_URI, SESSION_SECRET,
@@ -217,7 +276,7 @@ PASS (static) — naming is consistent across .env.example, server.js,
   sources). No real secrets in .env.example; no production values hard-coded.
 
 ================================================================================
-12. SECURITY AUDIT
+13. SECURITY AUDIT
 ================================================================================
 PASS (static) — CORS allowlist via CLIENT_ORIGIN (comma-separated); no-Origin
   requests (internal webhooks) allowed.
@@ -244,7 +303,7 @@ PASS (static) — no debug endpoints, no dev credentials, no committed .env (onl
   accounts, no Firebase/Google secrets (git ls-files + pattern scans clean).
 
 ================================================================================
-13. VERCEL FRONTEND AUDIT
+14. VERCEL FRONTEND AUDIT
 ================================================================================
 PASS (static) — client/src/services/api.js uses `import.meta.env.VITE_API_URL ||
   '/api'`; vite dev proxy localhost:5000 is dev-only (never shipped).
@@ -258,7 +317,7 @@ UNVERIFIED — live Vercel project settings (final Blitz domain not set yet by
   design; placeholder used).
 
 ================================================================================
-14. STATIC TEST RESULTS
+15. STATIC TEST RESULTS
 ================================================================================
 PASS — node --check on all 16 server/supervisor JS files.
 PASS — bash -n deploy/blitz/entrypoint.sh.
@@ -278,25 +337,32 @@ PASS — grep audit: no uid 10001; no /root refs; no Baileys in Customer AI; no
   deploy/blitz/, dist).
 PASS — git status shows only intended files; `git diff --check` clean;
   __pycache__ artifacts removed.
-PASS — Dockerfile syntax validated with hadolint (no parse errors; only two
-  pre-existing style warnings: DL3008 apt version pinning, DL4006 pipefail).
+PASS — Dockerfile syntax validated with hadolint after the npm-cache fix: no
+  parse errors; only pre-existing DL3008/DL4006 warnings + one informational
+  DL3059 (consecutive RUNs — intentional, keeps the root npm layer separately
+  cacheable from the ownership-fix layer).
+PASS — npm/cache audit (this audit): exactly two npm steps in stage 2 — the
+  root `npm ci --omit=dev` (creates the root-owned cache) and the customerai
+  bridge `npm ci --prefix` (fails without the chown). Stage 1 npm steps use
+  HOME=/root (scratch stage). No native/node-gyp deps (pure-JS lockfile
+  deps); the chown -R also covers ~/.node-gyp if ever needed.
 PASS — Bookworm package audit vs the live bookworm/main index (binary-amd64):
-  python3-ensurepip ABSENT (root cause of the build failure); python3,
-  python3-venv, git, curl, ca-certificates, passwd all PRESENT. python3.11-venv
-  Depends on python3-pip-whl + python3-setuptools-whl and on python3.11-distutils
-  (satisfied via python3-distutils' Provides), so created venvs keep pip/ensurepip.
+  python3-ensurepip ABSENT (fix 1 root cause); python3, python3-venv, git,
+  curl, ca-certificates, passwd all PRESENT. python3.11-venv Depends on
+  python3-pip-whl + python3-setuptools-whl and on python3.11-distutils
+  (satisfied via python3-distutils' Provides).
 PASS — simulated apt dependency resolution of the fixed install line: 84
   packages resolve, no unresolved dependencies.
 PASS — grep: no `pip install` / `python -m pip` / `ensurepip` invocation
   anywhere in the repo; Hermes/supervisor only use /opt/hermes-agent/venv/bin/python.
 
 ================================================================================
-15. DOCKER TEST RESULTS
+16. DOCKER TEST RESULTS
 ================================================================================
-PASS (static) — the docker build blocker is FIXED: the apt step no longer
-  installs python3-ensurepip (absent from Bookworm, which made `apt-get install`
-  fail at Dockerfile line 60). Dependency resolution confirms the fixed line is
-  installable (section 14).
+PASS (static) — both Docker build blockers are fixed: no more python3-ensurepip
+  apt install, and /home/customerai ownership (incl. .npm cache) is restored to
+  uid/gid 1000 before the first customerai npm step. Dependency resolution
+  confirms the apt line is installable (section 15).
 UNVERIFIED — actual docker build/run still NOT executed (daemon unavailable).
   docker build (linux/amd64), docker run --user 1000:1000 --cap-drop ALL --
   security-opt no-new-privileges, GET :8080/api/health, Hermes-startup test,
@@ -307,20 +373,20 @@ UNVERIFIED — actual docker build/run still NOT executed (daemon unavailable).
   Docker-related is claimed as PASS on the strength of static reasoning.
 
 ================================================================================
-16. WHATSAPP PAIRING STATUS
+17. WHATSAPP PAIRING STATUS
 ================================================================================
 UNVERIFIED — initial Hermes WhatsApp pairing method on Blitz Cloud.
 No interactive-shell claim, no QR endpoint, no real session copied. Status
 changes only with real verified evidence from the Blitz environment.
 
 ================================================================================
-17. REMAINING BLOCKERS
+18. REMAINING BLOCKERS
 ================================================================================
 - BLOCKER 1 (must be executed by the operator): docker build --platform
   linux/amd64 -t customer-ai-blitz:test . — validates the Hermes clone, uv
-  sync --extra all --locked, bridge npm ci, and the uid/gid-1000 usermod path.
-  (The python3-ensurepip failure is fixed; this blocker is now purely
-  "run the build".)
+  sync --extra all --locked, bridge npm ci (now with a uid-1000 cache), and the
+  uid/gid-1000 usermod path. (Both prior failures are fixed; this blocker is now
+  purely "run the build".)
 - BLOCKER 2: docker run with --user 1000:1000 --cap-drop ALL --security-opt
   no-new-privileges -v customer-ai-test:/home/customerai/.hermes + MONGODB_URI,
   then curl /api/health (expect 200, no permission errors).
@@ -332,7 +398,7 @@ changes only with real verified evidence from the Blitz environment.
 - NOTE: Blitz persistent folders are not backed up by Blitz (documented).
 
 ================================================================================
-18. EXACT NEXT STEP
+19. EXACT NEXT STEP
 ================================================================================
 Run, on a machine with a working Docker daemon:
   1) docker build --platform linux/amd64 -t customer-ai-blitz:test .
@@ -350,7 +416,7 @@ Run, on a machine with a working Docker daemon:
   5) Persistence probe: touch a harmless file in /home/customerai/.hermes, stop,
      start a second container on the same volume, verify the file remains.
   6) Only after 1-5 pass, configure Blitz env vars + persistent volume + port
-     8080 and resolve the WhatsApp pairing blocker (section 17).
+     8080 and resolve the WhatsApp pairing blocker (section 18).
 Do NOT pair WhatsApp or send messages during these checks.
 
 ================================================================================
