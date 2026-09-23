@@ -1,15 +1,16 @@
-===============================================================================
-Customer AI <-> Hermes <-> WhatsApp — FINAL STATIC AUDIT / BLITZ READINESS
+================================================================================
+Customer AI <-> Hermes <-> WhatsApp — CURRENT STATIC AUDIT / BLITZ READINESS
 + Docker build fix (Debian Bookworm: python3-ensurepip package does not exist)
-===============================================================================
+================================================================================
 Date: 2026-09-23. Mode: static audit only. Nothing deployed, pushed, SSH'd,
 paired, or messaged.
-Local WhatsApp session and ~/.hermes were READ-ONLY during this audit. This is
-the single current report (previous reports replaced per the operator rule).
+Local WhatsApp session and ~/.hermes treated READ-ONLY. This file is the ONLY
+current report: previous versions were removed, not kept (operator rule: always
+replace the old report with the new one).
 
-===============================================================================
+================================================================================
 1. CURRENT STATUS
-===============================================================================
+================================================================================
 Repository is in a clean, deployment-ready static state for Blitz Cloud:
 Dockerfile (uid/gid 1000, port 8080, empty VOLUME at /home/customerai/.hermes,
 non-root, no Nginx/systemd), entrypoint + Node supervisor, seeded sanitized
@@ -19,176 +20,183 @@ which does not exist in Debian Bookworm) was removed from the apt install line.
 Docker build/run STILL could NOT be executed (no daemon access), so everything
 that requires the container remains explicitly UNVERIFIED.
 
-===============================================================================
-2. CHANGES MADE (this audit; all minimal, no refactors)
-===============================================================================
+================================================================================
+2. CHANGES MADE (all minimal, no refactors)
+================================================================================
+- Dockerfile: removed `python3-ensurepip` from the apt install line — the
+  package does not exist in Debian Bookworm and broke `docker build` at the apt
+  step (the original failure point). Committed alone as e2b6540.
 - Dockerfile: added note that /api/health is DB-backed, so the backend-only
   smoke run needs -e MONGODB_URI=<atlas-uri> (without it the health check 503s
   and the supervisor exits after the wait — correct fail-fast, now documented).
 - README section K: documented the same MONGODB_URI requirement for /api/health.
-- hermes/: removed __pycache__ / *.pyc artifacts created by this audit's
+- hermes/: removed __pycache__ / *.pyc artifacts created by an earlier audit's
   py_compile run (git hygiene). No source changes.
-- Dockerfile: removed `python3-ensurepip` from the apt install line — the
-  package does not exist in Debian Bookworm and broke `docker build` at the
-  apt step. Verified the remaining packages (python3 python3-venv git curl
-  ca-certificates passwd) against the Bookworm index; `python3-venv` pulls
-  python3.11-venv, which bundles ensurepip + python3-pip-whl/setuptools-whl,
-  so `python3 -m venv` and in-venv pip still work without it. Hermes needs no
-  apt ensurepip either (its venv is built by `uv venv --python 3.11` + `uv sync
-  --locked`, and nothing in the repo invokes `pip`/`ensurepip` at runtime).
-  Committed alone as e2b6540.
 No application, gate, WhatsApp-ownership, or frontend behavior changed.
 
-===============================================================================
-3. UID/GID VERIFICATION
-===============================================================================
+================================================================================
+3. DOCKER BUILD FIX — VERIFICATION (python3-ensurepip)
+================================================================================
+PASS (static) — confirmed against the live Debian Bookworm package index
+  (deb.debian.org dists/bookworm/main, binary-amd64 Packages):
+    - python3-ensurepip       ABSENT      <- exact cause of the apt failure
+    - python3, python3-venv, git, curl, ca-certificates, passwd   all PRESENT
+PASS (static) — python3-venv still provides working venvs without ensurepip:
+  it Depends on python3.11-venv, which bundles ensurepip and pulls
+  python3-pip-whl + python3-setuptools-whl (so even pip inside a venv works);
+  python3.11-distutils is satisfied via python3-distutils' Provides.
+PASS (static) — Hermes needs no apt ensurepip: its venv is built by
+  `uv venv --python 3.11` + `uv sync --extra all --locked` (uv manages the
+  Python/build itself); grep confirms no `pip install`, `python -m pip`, or
+  `ensurepip` invocation anywhere in the repo; the gateway/supervisor only use
+  /opt/hermes-agent/venv/bin/python.
+PASS (static) — simulated apt dependency resolution of the fixed install line:
+  84 packages (incl. transitive deps) resolve with no unresolved dependency.
+PASS (static) — Dockerfile parses cleanly under hadolint (only two pre-existing
+  style warnings: DL3008 apt version pinning, DL4006 pipefail).
+UNVERIFIED — actual `docker build` (daemon inaccessible; see section 14).
+
+================================================================================
+4. UID/GID VERIFICATION
+================================================================================
 PASS (static) — Dockerfile renames the Node base image's built-in uid/gid-1000
-user (`node`) to `customerai`, moves HOME to /home/customerai, renames group to
-`customerai` (gid 1000 preserved), and a build-time assertion
-`test $(id -u customerai) -eq 1000 && test $(id -g customerai) -eq 1000` fails
-the build otherwise.
-PASS (static) — no remaining UID 10001 reference anywhere except the historical
-note in this report. `rg 10001` clean on Dockerfile/README/env/server/hermes.
+  user (`node`) to `customerai`, moves HOME to /home/customerai, renames group
+  to `customerai` (gid 1000 preserved), and a build-time assertion
+  `test $(id -u customerai) -eq 1000 && test $(id -g customerai) -eq 1000`
+  fails the build otherwise.
+PASS (static) — no remaining UID 10001 reference anywhere (grep clean on
+  Dockerfile/README/env/server/hermes).
 PASS (static) — no runtime sudo; no runtime chown (ownership fixed at build);
-no setuid/no-new-privileges dependency; container is designed for
-`--user 1000:1000 --cap-drop ALL --security-opt no-new-privileges`.
+  no setuid/no-new-privileges dependency; container designed for
+  `--user 1000:1000 --cap-drop ALL --security-opt no-new-privileges`.
 UNVERIFIED — actual build/runtime under `--user 1000:1000` (no Docker daemon).
-USER, HOME=/home/customerai, group, and ownership are internally consistent
-(usermod/groupmod apply before any chown/COPY --chown; all paths then use
-customerai).
+USER, HOME, group, ownership are internally consistent (usermod/groupmod apply
+before any chown/COPY --chown; all paths then use customerai).
 
-===============================================================================
-4. RUNTIME WRITE-PATH AUDIT
-===============================================================================
+================================================================================
+5. RUNTIME WRITE-PATH AUDIT
+================================================================================
 PASS (static) — every runtime writable location resolves to owner uid 1000 or a
-world-writable tmp, none requires root:
-  /home/customerai/.hermes        HERMES_HOME — customerai-owned, VOLUME-backed,
-                                  created writable by the entrypoint before any
-                                  gateway/backend process starts; Hermes state
-                                  (config.yaml, gateway_state.json, gateway.pid/
-                                  .lock/.sock, state/gateway.heartbeat,
-                                  channel_directory.json, cron/, kanban/, cache/,
-                                  logs/, pending_messages/, platforms/whatsapp/
-                                  session, pairing/, backups/) all live here.
-                                  NEEDS PERSISTENCE.
-  /home/customerai/.local         customerai-owned (launcher + uv cache from
-                                  build). Runtime reads only; writable anyway.
-                                  No persistence needed.
-  /home/customerai/.local/bin     contains the `hermes` launcher (uid 1000 +x).
-  /opt/hermes-agent               customerai-owned (install tree, read-only-ish).
-                                  GATEWAY PYTHON venv + hermes package here;
-                                  bridge dir writable so whatsapp_common.py
-                                  resolve_whatsapp_bridge_dir() uses it in place
-                                  (the only runtime write here is its
-                                  .write_test touch; npm deps prebuilt at image
-                                  build, no runtime npm). No persistence needed
-                                  (session/caches live under ~/.hermes).
-  /opt/customer-ai               customerai-owned; config/plugin/hook SEED
-                                  templates read on first boot only. No writes.
-  /app                           customerai-owned; supervisor + client dist +
-                                  server src. Read-only at runtime.
-  /app/server/node_modules       root-owned (build-time `npm ci`); READ-ONLY at
-                                  runtime (server never writes there).
-  /tmp, /var/tmp                 world-writable (Node/Python temp).
+  world-writable tmp; none requires root:
+    /home/customerai/.hermes       HERMES_HOME — customerai-owned, VOLUME-backed,
+                                   created writable by the entrypoint before any
+                                   gateway/backend process starts; Hermes state
+                                   (config.yaml, gateway_state.json, gateway.pid/
+                                   .lock/.sock, state/gateway.heartbeat,
+                                   channel_directory.json, cron/, kanban/, cache/,
+                                   logs/, pending_messages/, platforms/whatsapp/
+                                   session, pairing/, backups/) all live here.
+                                   NEEDS PERSISTENCE.
+    /home/customerai/.local        customerai-owned (launcher + uv cache from
+                                   build). Runtime reads only; no persistence.
+    /home/customerai/.local/bin    contains the `hermes` launcher (uid 1000 +x).
+    /opt/hermes-agent              customerai-owned (install tree, read-only-ish).
+                                   GATEWAY PYTHON venv + hermes package here;
+                                   bridge dir writable so whatsapp_common.py
+                                   resolve_whatsapp_bridge_dir() uses it in
+                                   place (only runtime write is its .write_test
+                                   touch; npm deps prebuilt at build). No
+                                   persistence needed (session/caches under
+                                   ~/.hermes).
+    /opt/customer-ai               customerai-owned; SEED templates read on
+                                   first boot only. No writes.
+    /app                           customerai-owned; supervisor + client dist +
+                                   server src. Read-only at runtime.
+    /app/server/node_modules       root-owned (build-time `npm ci`); READ-ONLY
+                                   at runtime.
+    /tmp, /var/tmp                 world-writable (Node/Python temp).
 PASS (static) — bridge.js runtime writes are SESSION_DIR
-(-> HERMES_HOME/whatsapp/session) and caches under ~/.hermes; nothing else.
-PASS (static) — the bridge is resolved via resolved install tree path (writable
-check) and NODE is located from PATH (node 22 at /usr/local/bin). Session dir is
-passed explicitly as HERMES_HOME/whatsapp/session.
-NOTE — previous report wording claiming gateway state/logs/pending live under
-/opt/hermes-agent is CORRECTED: they are under $HERMES_HOME
-(/home/customerai/.hermes), confirmed against Hermes get_hermes_home().
+  (-> HERMES_HOME/whatsapp/session) and caches under ~/.hermes; nothing else.
+PASS (static) — the bridge is resolved via the resolved install-tree path
+  (writable check); NODE located from PATH (node 22). Session dir passed
+  explicitly as HERMES_HOME/whatsapp/session.
+NOTE — gateway state/logs/pending live under $HERMES_HOME
+  (/home/customerai/.hermes), confirmed against Hermes get_hermes_home().
 
-===============================================================================
-5. HERMES CLI AUDIT
-===============================================================================
-PASS (static) — the launcher file is created by the Dockerfile at
-/home/customerai/.local/bin/hermes: `exec /opt/hermes-agent/venv/bin/python
-/opt/hermes-agent/hermes "$@"` (mirrors the verified local launcher, but with
-container paths — no developer-machine absolute path, no /root).
+================================================================================
+6. HERMES CLI AUDIT
+================================================================================
+PASS (static) — the Dockerfile creates /home/customerai/.local/bin/hermes:
+  `exec /opt/hermes-agent/venv/bin/python /opt/hermes-agent/hermes "$@"`
+  (container paths — no developer-machine absolute path, no /root).
 PASS (static) — shebang `#!/usr/bin/env bash` valid; bash present in
-node:22-bookworm-slim; venv python exists at /opt/hermes-agent/venv/bin/python
-(created by `uv venv` + `uv sync --extra all --locked`, the verified install
-path); the `hermes` entry script exists at the Hermes repo root (verified in the
-cloned tree at the pinned commit 4716ec0).
+  node:22-bookworm-slim; venv python exists at /opt/hermes-agent/venv/bin/python
+  (created by `uv venv` + `uv sync --extra all --locked`, the verified install
+  path); the `hermes` entry script exists at the Hermes repo root at the pinned
+  commit 4716ec0.
 PASS (static) — PATH includes /home/customerai/.local/bin and
-/opt/hermes-agent/venv/bin; backend HERMES_BIN default resolves (env set in
-Dockerfile + .env.example); executable by uid 1000 (file +x, owner customerai).
+  /opt/hermes-agent/venv/bin; backend HERMES_BIN default resolves (set in
+  Dockerfile + .env.example); executable by uid 1000.
 PASS (static) — supervisor launches the gateway via the venv python directly
-(`python -m hermes_cli.main gateway run`), independent of the launcher.
-UNVERIFIED — in-container execution of `hermes send`/`gateway pair` and
-launcher invocation (needs a build).
+  (`python -m hermes_cli.main gateway run`), independent of the launcher.
+UNVERIFIED — in-container execution of `hermes send` / `gateway pair` and
+  launcher invocation (needs a build).
 
-===============================================================================
-6. HERMES CONFIG/PLUGIN/HOOK AUDIT
-===============================================================================
+================================================================================
+7. HERMES CONFIG/PLUGIN/HOOK AUDIT
+================================================================================
 PASS (static) — hermes/configuration/config.yaml is a SANITIZED template: no API
-keys, no passwords, no session, no real WhatsApp JID (operator JID excluded;
-placeholders `3247...@lid`/`<operator-chat>@lid` only), no developer-only paths.
+  keys, no passwords, no session, no real WhatsApp JID (placeholders
+  `3247...@lid` / `<operator-chat>@lid` only), no developer-only paths.
 PASS (static) — security-critical keys match the verified live config:
-provider custom:groq, plugin customer-ai-gate, key_env GROQ_API_KEY,
-reasoning_effort medium, display.show_reasoning true with whatsapp
-show_reasoning false, delivery_ledger true, allow_all_users false,
-unauthorized_dm_behavior ignore, platforms.whatsapp.enabled true.
-PASS (static) — the repo plugin/hook files are byte-identical to the verified
-~/.hermes originals (diff -q).
-PASS (static) — WHATSAPP_HOME_CHANNEL env is honored by the gateway
-(gateway/config_env.py `_env_home_channel`, present at the pinned commit) and by
-the customer-ai-gate plugin (reads env first) — operator home bypass works
-without embedding the JID. CAI_HOOK_BASE_URL defaults to 127.0.0.1:5000 in the
-plugin/hook but the Dockerfile/entrypoint/env supply http://127.0.0.1:8080
-(container-local; both processes share the container).
+  provider custom:groq, plugin customer-ai-gate, key_env GROQ_API_KEY,
+  reasoning_effort medium, display.show_reasoning true with whatsapp
+  show_reasoning false, delivery_ledger true, allow_all_users false,
+  unauthorized_dm_behavior ignore, platforms.whatsapp.enabled true.
+PASS (static) — repo plugin/hook files byte-identical to the verified ~/.hermes
+  originals (diff -q).
+PASS (static) — WHATSAPP_HOME_CHANNEL env honored by the gateway
+  (config_env.py `_env_home_channel` at the pinned commit) and by the
+  customer-ai-gate plugin (reads env first) — operator home bypass works without
+  embedding the JID. CAI_HOOK_BASE_URL defaults to 127.0.0.1:5000 in the
+  plugin/hook, but Dockerfile/entrypoint/env supply http://127.0.0.1:8080
+  (container-local; both processes share the container).
 PASS (static) — Customer AI does NOT connect to WhatsApp/Baileys anywhere in
-server/src or client/src (grep baileys/@whiskeysockets: none). WhatsApp is owned
-solely by Hermes; Customer AI is the gate plus the hermes-send human queue.
+  server/src or client/src. WhatsApp is owned solely by Hermes; Customer AI is
+  the gate plus the hermes-send human queue.
 Architecture: Vercel -> Customer AI+Hermes+bridge container -> WhatsApp;
-MongoDB Atlas stays external (no mongod in image, no localhost DB assumption).
+MongoDB Atlas stays external (no mongod in the image, no localhost DB assumption).
 
-===============================================================================
-7. BLITZ NETWORK/PORT AUDIT
-===============================================================================
+================================================================================
+8. BLITZ NETWORK/PORT AUDIT
+================================================================================
 PASS (static) — Dockerfile ENV HOST=0.0.0.0, PORT=8080; EXPOSE 8080.
 PASS (static) — server.js binds `app.listen(PORT||5000, HOST||'127.0.0.1')` —
-env-controlled; the 127.0.0.1/5000 defaults exist only for local dev. No other
-hard-coded bind/port in server source (grep: the only localhost:5000 is the Vite
-dev proxy, dev-only).
+  env-controlled; the 127.0.0.1/5000 defaults exist only for local dev. The only
+  other localhost:5000 is the Vite dev proxy (dev-only).
 PASS (static) — no Nginx dependency, no systemd dependency anywhere in the
-container path; supervisor assumes container PID-1 semantics (not supervisor/systemd).
+  container path; supervisor assumes container PID-1 semantics.
 UNVERIFIED — actual ingress routing on the Blitz platform (see section 16).
 
-===============================================================================
-8. PERSISTENCE/VOLUME AUDIT
-===============================================================================
+================================================================================
+9. PERSISTENCE/VOLUME AUDIT
+================================================================================
 PASS (static) — Dockerfile declares `VOLUME ["/home/customerai/.hermes"]`.
 PASS (static) — all Hermes runtime state that must survive restarts is under
-$HERMES_HOME (see section 4), confirmed against Hermes get_hermes_home() and the
-bridge's SESSION_DIR/IMAGE_CACHE_DIR defaults. No state is written outside that
-needs persistence.
+  $HERMES_HOME (see section 5), confirmed against Hermes get_hermes_home() and
+  the bridge's SESSION_DIR/IMAGE_CACHE_DIR defaults. Nothing outside needs
+  persistence.
 PASS (static) — the image ships an EMPTY Hermes home; .dockerignore excludes
-~/.hermes session data, `.env`/secrets, node_modules, dist, caches, *.db,
-creds.json, whatsapp-session, data/ — the local developer home cannot reach the
-image. No unnecessary VOLUME declarations added.
+  session data, `.env`/secrets, node_modules, dist, caches, *.db, creds.json,
+  whatsapp-session, data/ — the local developer home cannot reach the image.
 
-===============================================================================
-9. SUPERVISOR/ENTRYPOINT AUDIT
-===============================================================================
+================================================================================
+10. SUPERVISOR/ENTRYPOINT AUDIT
+================================================================================
 PASS (static) — startup order: entrypoint seeds HERMES_HOME (config/plugin/hook,
-idempotent first-boot-only) and creates runtime dirs, then execs the Node
-supervisor as PID 1 -> backend -> poll /api/health (120s) -> Hermes gateway ->
-bridge (spawned by gateway). HERMES_ENABLED=false skips the gateway.
-PASS (static) — supervisor forwards SIGTERM/SIGINT/SIGHUP, shuts the gateway down
-first (session flush) then backend, kills lingerers after grace, and exits
-non-zero on unexpected child death (container restart). Nothing requires root.
-PASS (static) — working dirs/env are correct: backend cwd /app/server; gateway
-cwd /opt/hermes-agent with venv python; env inherited wholesale from the
-container (Dockerfile defaults + Blitz injected).
+  idempotent first-boot-only) and creates runtime dirs, then execs the Node
+  supervisor as PID 1 -> backend -> poll /api/health (120s) -> Hermes gateway ->
+  bridge (spawned by gateway). HERMES_ENABLED=false skips the gateway.
+PASS (static) — supervisor forwards SIGTERM/SIGINT/SIGHUP, shuts the gateway
+  down first (session flush) then backend, kills lingerers after grace, exits
+  non-zero on unexpected child death (container restart). Nothing requires root.
+PASS (static) — cwd/env correct: backend cwd /app/server; gateway cwd
+  /opt/hermes-agent with venv python; env inherited wholesale from the container.
 UNVERIFIED — runtime behavior in-container (build required).
-NOTE — the documented backend-only smoke command additionally needs MONGODB_URI
-(this was the one doc gap found; now fixed in Dockerfile header + README K).
 
-===============================================================================
-10. ENVIRONMENT VARIABLE AUDIT
-===============================================================================
+================================================================================
+11. ENVIRONMENT VARIABLE AUDIT
+================================================================================
 PASS (static) — .env.example separates:
   A) Customer AI: NODE_ENV, HOST, PORT, TRUST_PROXY, MONGODB_URI, SESSION_SECRET,
      AI_API_KEY, AI_MODEL, AI_CONFIDENCE_THRESHOLD, ADMIN_EMAIL, ADMIN_PASSWORD,
@@ -200,60 +208,58 @@ PASS (static) — .env.example separates:
      WHATSAPP_ALLOW_ALL_USERS (consumed by gateway run.py startup safety check),
      WHATSAPP_HOME_CHANNEL
   D) Blitz: HOST=0.0.0.0, PORT=8080 (also Dockerfile ENV defaults)
-  E) Frontend/Vercel: VITE_API_URL (client/.env.example; endings /api)
+  E) Frontend/Vercel: VITE_API_URL (client/.env.example; ends with /api)
   F) Optional: CLIENT_ORIGIN (default localhost:5173 in code), GROQ_API_KEY,
      WHATSAPP_SETUP_TOKEN (legacy 409 routes)
 PASS (static) — naming is consistent across .env.example, server.js,
-whatsapp.service.js, system.js, hermes.js, the supervisor, the entrypoint, the
-plugin, the hook, and Hermes config_env.py (verified each var by grep at the
-referenced sources). No real secrets in .env.example (placeholders only); no
-production values hard-coded anywhere.
+  whatsapp.service.js, system.js, hermes.js, the supervisor, the entrypoint, the
+  plugin, the hook, and Hermes config_env.py (verified by grep at the referenced
+  sources). No real secrets in .env.example; no production values hard-coded.
 
-===============================================================================
-11. SECURITY AUDIT
-===============================================================================
+================================================================================
+12. SECURITY AUDIT
+================================================================================
 PASS (static) — CORS allowlist via CLIENT_ORIGIN (comma-separated); no-Origin
-requests (internal webhooks) allowed.
+  requests (internal webhooks) allowed.
 PASS (static) — rate limiting 240 req/min per 60s on /api with standard headers.
-PASS (static) — admin seed is safe: in production an admin is created ONLY when
-ADMIN_EMAIL + ADMIN_PASSWORD are provided; never demo/default credentials;
-SEED_PRINT_CREDENTIALS defaults false.
+PASS (static) — admin seed is safe: admin created ONLY when ADMIN_EMAIL +
+  ADMIN_PASSWORD are provided; never demo/default credentials;
+  SEED_PRINT_CREDENTIALS defaults false.
 PASS (static) — SESSION_SECRET required for JWT auth (12h expiry, requireAuth on
-all data routes, requireAdmin on settings writes).
-PASS (static) — webhook authentication: /api/hermes/webhook/* require
-x-cai-hook-secret validated with timing-safe compare; unconfigured secret => 503;
-gate fail-closed on non-200 / unreachable (plugin logs class/status only, never
-content).
-PASS (static) — no secrets in logs (morgan 'tiny', gateway/tap log redaction ON
-by default in config template); groq key from env only.
+  all data routes, requireAdmin on settings writes).
+PASS (static) — webhook auth: /api/hermes/webhook/* require x-cai-hook-secret
+  validated with timing-safe compare; unconfigured secret => 503; gate
+  fail-closed on non-200 / unreachable (plugin logs class/status only).
+PASS (static) — no secrets in logs (morgan 'tiny'; gateway/tap log redaction ON
+  by default in the config template); groq key from env only.
 PASS (static) — no JID/message-content leakage (grep clean); the real operator
-JID is not in the repo (matched against ~/.hermes config: not present).
-PASS (static) — no public pairing endpoint: /api/whatsapp/qr requires setup
-token AND always returns 404 "managed by Hermes"; connect/disconnect/reset all
-409. No QR invented/exposed.
+  JID is not in the repo.
+PASS (static) — no public pairing endpoint: /api/whatsapp/qr requires the setup
+  token AND always returns 404 "managed by Hermes"; connect/disconnect/reset all
+  409. No QR invented/exposed.
 PASS (static) — no unrestricted WhatsApp access: allow_all_users false +
-unauthorized_dm_behavior ignore in seed config; home-channel bypass env-driven.
+  unauthorized_dm_behavior ignore in seed config; home-channel bypass env-driven.
 PASS (static) — no debug endpoints, no dev credentials, no committed .env (only
-both .env.example tracked), no WhatsApp session, no private keys, no service
-accounts, no Firebase/Google secrets (git ls-files + pattern scans all clean).
+  .env.example files tracked), no WhatsApp session, no private keys, no service
+  accounts, no Firebase/Google secrets (git ls-files + pattern scans clean).
 
-===============================================================================
-12. VERCEL FRONTEND AUDIT
-===============================================================================
+================================================================================
+13. VERCEL FRONTEND AUDIT
+================================================================================
 PASS (static) — client/src/services/api.js uses `import.meta.env.VITE_API_URL ||
-'/api'`; vite dev proxy localhost:5000 is dev-only (never shipped).
-PASS (static) — production build with placeholder VITE_API_URL=https://
-example-blitz-domain/api succeeds; the URL is embedded in dist; bundle contains
-no localhost:5000 / ChangeMe123 / demo admin strings.
+  '/api'`; vite dev proxy localhost:5000 is dev-only (never shipped).
+PASS (static) — production build with a placeholder VITE_API_URL succeeds; the
+  URL is embedded in dist; bundle contains no localhost:5000 / ChangeMe123 /
+  demo admin strings.
 PASS (static) — Vercel serves client/ only (vercel.json SPA rewrite; no server
-routes/functions); no server-side secrets flow through VITE (template says so);
-CORS expectation matches CLIENT_ORIGIN = https://<vercel-domain>.
+  routes/functions); no server-side secrets flow through VITE; CORS expectation
+  matches CLIENT_ORIGIN = https://<vercel-domain>.
 UNVERIFIED — live Vercel project settings (final Blitz domain not set yet by
-design; placeholder used).
+  design; placeholder used).
 
-===============================================================================
-13. STATIC TEST RESULTS
-===============================================================================
+================================================================================
+14. STATIC TEST RESULTS
+================================================================================
 PASS — node --check on all 16 server/supervisor JS files.
 PASS — bash -n deploy/blitz/entrypoint.sh.
 PASS — python3 -m py_compile on gate plugin + tap hook.
@@ -266,55 +272,54 @@ PASS — backend local smoke (HOST=127.0.0.1 PORT=5199 TRUST_PROXY=1):
   401; CORS allow reflected + disallowed origin blocked (no ACAO); no-Origin OK;
   RateLimit-Policy 240;w=60 present; /api/whatsapp/qr and /connect 401 without
   setup token.
-PASS — grep audit: no uid 10001 outside this report; no /root refs; no Baileys
-  in Customer AI; no secrets; no real JID; .dockerignore excludes session,
-  .env, node_modules, dist, caches, *.db; COPY sources all exist
-  (client+server lockfiles, hermes/, deploy/blitz/, dist).
+PASS — grep audit: no uid 10001; no /root refs; no Baileys in Customer AI; no
+  secrets; no real JID; .dockerignore excludes session, .env, node_modules,
+  dist, caches, *.db; COPY sources all exist (client+server lockfiles, hermes/,
+  deploy/blitz/, dist).
 PASS — git status shows only intended files; `git diff --check` clean;
-  __pycache__ artifacts from this audit removed.
+  __pycache__ artifacts removed.
 PASS — Dockerfile syntax validated with hadolint (no parse errors; only two
   pre-existing style warnings: DL3008 apt version pinning, DL4006 pipefail).
-PASS — Bookworm package audit against the live bookworm/main index
-  (deb.debian.org, binary-amd64 Packages): python3-ensurepip is ABSENT
-  (root cause of the build failure); python3, python3-venv, git, curl,
-  ca-certificates, passwd all PRESENT. python3.11-venv Depends on python3-pip-whl
-  + python3-setuptools-whl and pends on python3.11-distutils (satisfied via
-  python3-distutils' Provides), so created venvs keep pip/ensurepip.
-PASS — simulated apt dependency resolution of the fixed install line:
-  84 packages resolve, no unresolved dependencies.
-PASS — grep: no `pip install`/`python -m pip`/`ensurepip` invocation anywhere
-  in the repo; Hermes/supervisor only use /opt/hermes-agent/venv/bin/python.
+PASS — Bookworm package audit vs the live bookworm/main index (binary-amd64):
+  python3-ensurepip ABSENT (root cause of the build failure); python3,
+  python3-venv, git, curl, ca-certificates, passwd all PRESENT. python3.11-venv
+  Depends on python3-pip-whl + python3-setuptools-whl and on python3.11-distutils
+  (satisfied via python3-distutils' Provides), so created venvs keep pip/ensurepip.
+PASS — simulated apt dependency resolution of the fixed install line: 84
+  packages resolve, no unresolved dependencies.
+PASS — grep: no `pip install` / `python -m pip` / `ensurepip` invocation
+  anywhere in the repo; Hermes/supervisor only use /opt/hermes-agent/venv/bin/python.
 
-===============================================================================
-14. DOCKER TEST RESULTS
-===============================================================================
-PASS (static) — the previously reported docker build blocker is FIXED: the apt
-  step no longer installs python3-ensurepip (absent from Bookworm, which made
-  `apt-get install` fail at Dockerfile line 60). This report's dependency
-  resolution confirms the fixed line is installable (see section 13).
+================================================================================
+15. DOCKER TEST RESULTS
+================================================================================
+PASS (static) — the docker build blocker is FIXED: the apt step no longer
+  installs python3-ensurepip (absent from Bookworm, which made `apt-get install`
+  fail at Dockerfile line 60). Dependency resolution confirms the fixed line is
+  installable (section 14).
 UNVERIFIED — actual docker build/run still NOT executed (daemon unavailable).
   docker build (linux/amd64), docker run --user 1000:1000 --cap-drop ALL --
   security-opt no-new-privileges, GET :8080/api/health, Hermes-startup test,
   Hermes-home write test, persistent-volume test, and in-container HERMES_BIN
   invocation were NOT executed. The docker CLI exists but the daemon socket
   /var/run/docker.sock is root:docker and this shell has neither the docker
-  group nor passwordless sudo. No privilege/group changes were made; no
-  Docker-related test is claimed as PASS on the strength of static reasoning.
+  group nor passwordless sudo. No privilege/group changes were made; nothing
+  Docker-related is claimed as PASS on the strength of static reasoning.
 
-===============================================================================
-15. WHATSAPP PAIRING STATUS
-===============================================================================
+================================================================================
+16. WHATSAPP PAIRING STATUS
+================================================================================
 UNVERIFIED — initial Hermes WhatsApp pairing method on Blitz Cloud.
 No interactive-shell claim, no QR endpoint, no real session copied. Status
 changes only with real verified evidence from the Blitz environment.
 
-===============================================================================
-16. REMAINING BLOCKERS
-===============================================================================
+================================================================================
+17. REMAINING BLOCKERS
+================================================================================
 - BLOCKER 1 (must be executed by the operator): docker build --platform
   linux/amd64 -t customer-ai-blitz:test . — validates the Hermes clone, uv
   sync --extra all --locked, bridge npm ci, and the uid/gid-1000 usermod path.
-  (The prior python3-ensurepip failure is fixed; this blocker is now purely
+  (The python3-ensurepip failure is fixed; this blocker is now purely
   "run the build".)
 - BLOCKER 2: docker run with --user 1000:1000 --cap-drop ALL --security-opt
   no-new-privileges -v customer-ai-test:/home/customerai/.hermes + MONGODB_URI,
@@ -326,9 +331,9 @@ changes only with real verified evidence from the Blitz environment.
   (interactive shell vs. pre-built paired session seeded into the volume).
 - NOTE: Blitz persistent folders are not backed up by Blitz (documented).
 
-===============================================================================
-17. EXACT NEXT STEP
-===============================================================================
+================================================================================
+18. EXACT NEXT STEP
+================================================================================
 Run, on a machine with a working Docker daemon:
   1) docker build --platform linux/amd64 -t customer-ai-blitz:test .
   2) docker run --rm --platform linux/amd64 --user 1000:1000 --cap-drop ALL \
@@ -342,12 +347,12 @@ Run, on a machine with a working Docker daemon:
   4) Repeat with HERMES_ENABLED=true + safe test credentials; verify Hermes
      starts, Python executes, the bridge starts, no permission errors, and
      /home/customerai/.hermes gets seeded (config/plugin/hook).
-  5) Persistence probe: touch a harmless file in /home/customerai/.hermes,
-     stop, start a second container on the same volume, verify the file remains.
+  5) Persistence probe: touch a harmless file in /home/customerai/.hermes, stop,
+     start a second container on the same volume, verify the file remains.
   6) Only after 1-5 pass, configure Blitz env vars + persistent volume + port
-     8080 and resolve the WhatsApp pairing blocker (section 16).
+     8080 and resolve the WhatsApp pairing blocker (section 17).
 Do NOT pair WhatsApp or send messages during these checks.
 
-===============================================================================
-END OF REPORT
-===============================================================================
+================================================================================
+END OF REPORT — this is the only current report; any earlier version is replaced
+================================================================================
