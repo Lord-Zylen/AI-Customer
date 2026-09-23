@@ -1,7 +1,9 @@
 ===============================================================================
 Customer AI <-> Hermes <-> WhatsApp — FINAL STATIC AUDIT / BLITZ READINESS
++ Docker build fix (Debian Bookworm: python3-ensurepip package does not exist)
 ===============================================================================
-Mode: static audit only. Nothing deployed, pushed, SSH'd, paired, or messaged.
+Date: 2026-09-23. Mode: static audit only. Nothing deployed, pushed, SSH'd,
+paired, or messaged.
 Local WhatsApp session and ~/.hermes were READ-ONLY during this audit. This is
 the single current report (previous reports replaced per the operator rule).
 
@@ -12,8 +14,10 @@ Repository is in a clean, deployment-ready static state for Blitz Cloud:
 Dockerfile (uid/gid 1000, port 8080, empty VOLUME at /home/customerai/.hermes,
 non-root, no Nginx/systemd), entrypoint + Node supervisor, seeded sanitized
 Hermes config/plugin/hook, backend + Hermes + bridge all wired to one container,
-Vercel frontend only. Docker build/run could NOT be executed (no daemon access),
-so everything that requires the container is explicitly UNVERIFIED.
+Vercel frontend only. The one known Docker build blocker (python3-ensurepip,
+which does not exist in Debian Bookworm) was removed from the apt install line.
+Docker build/run STILL could NOT be executed (no daemon access), so everything
+that requires the container remains explicitly UNVERIFIED.
 
 ===============================================================================
 2. CHANGES MADE (this audit; all minimal, no refactors)
@@ -24,6 +28,15 @@ so everything that requires the container is explicitly UNVERIFIED.
 - README section K: documented the same MONGODB_URI requirement for /api/health.
 - hermes/: removed __pycache__ / *.pyc artifacts created by this audit's
   py_compile run (git hygiene). No source changes.
+- Dockerfile: removed `python3-ensurepip` from the apt install line — the
+  package does not exist in Debian Bookworm and broke `docker build` at the
+  apt step. Verified the remaining packages (python3 python3-venv git curl
+  ca-certificates passwd) against the Bookworm index; `python3-venv` pulls
+  python3.11-venv, which bundles ensurepip + python3-pip-whl/setuptools-whl,
+  so `python3 -m venv` and in-venv pip still work without it. Hermes needs no
+  apt ensurepip either (its venv is built by `uv venv --python 3.11` + `uv sync
+  --locked`, and nothing in the repo invokes `pip`/`ensurepip` at runtime).
+  Committed alone as e2b6540.
 No application, gate, WhatsApp-ownership, or frontend behavior changed.
 
 ===============================================================================
@@ -259,11 +272,27 @@ PASS — grep audit: no uid 10001 outside this report; no /root refs; no Baileys
   (client+server lockfiles, hermes/, deploy/blitz/, dist).
 PASS — git status shows only intended files; `git diff --check` clean;
   __pycache__ artifacts from this audit removed.
+PASS — Dockerfile syntax validated with hadolint (no parse errors; only two
+  pre-existing style warnings: DL3008 apt version pinning, DL4006 pipefail).
+PASS — Bookworm package audit against the live bookworm/main index
+  (deb.debian.org, binary-amd64 Packages): python3-ensurepip is ABSENT
+  (root cause of the build failure); python3, python3-venv, git, curl,
+  ca-certificates, passwd all PRESENT. python3.11-venv Depends on python3-pip-whl
+  + python3-setuptools-whl and pends on python3.11-distutils (satisfied via
+  python3-distutils' Provides), so created venvs keep pip/ensurepip.
+PASS — simulated apt dependency resolution of the fixed install line:
+  84 packages resolve, no unresolved dependencies.
+PASS — grep: no `pip install`/`python -m pip`/`ensurepip` invocation anywhere
+  in the repo; Hermes/supervisor only use /opt/hermes-agent/venv/bin/python.
 
 ===============================================================================
 14. DOCKER TEST RESULTS
 ===============================================================================
-UNVERIFIED — Docker unavailable.
+PASS (static) — the previously reported docker build blocker is FIXED: the apt
+  step no longer installs python3-ensurepip (absent from Bookworm, which made
+  `apt-get install` fail at Dockerfile line 60). This report's dependency
+  resolution confirms the fixed line is installable (see section 13).
+UNVERIFIED — actual docker build/run still NOT executed (daemon unavailable).
   docker build (linux/amd64), docker run --user 1000:1000 --cap-drop ALL --
   security-opt no-new-privileges, GET :8080/api/health, Hermes-startup test,
   Hermes-home write test, persistent-volume test, and in-container HERMES_BIN
@@ -285,6 +314,8 @@ changes only with real verified evidence from the Blitz environment.
 - BLOCKER 1 (must be executed by the operator): docker build --platform
   linux/amd64 -t customer-ai-blitz:test . — validates the Hermes clone, uv
   sync --extra all --locked, bridge npm ci, and the uid/gid-1000 usermod path.
+  (The prior python3-ensurepip failure is fixed; this blocker is now purely
+  "run the build".)
 - BLOCKER 2: docker run with --user 1000:1000 --cap-drop ALL --security-opt
   no-new-privileges -v customer-ai-test:/home/customerai/.hermes + MONGODB_URI,
   then curl /api/health (expect 200, no permission errors).
