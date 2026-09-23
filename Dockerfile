@@ -96,6 +96,7 @@ RUN mkdir -p /opt/customer-ai/hermes-config /opt/customer-ai/bridge /app \
 WORKDIR /app/server
 COPY --chown=customerai:customerai server/package*.json ./
 RUN npm ci --omit=dev
+RUN chown -R customerai:customerai /home/customerai
 COPY --chown=customerai:customerai server/src ./src
 # Hermes plugin/hook/config templates (seeded into HERMES_HOME on first boot).
 COPY --chown=customerai:customerai hermes/ /opt/customer-ai/hermes-config/
