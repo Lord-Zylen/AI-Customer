@@ -113,6 +113,10 @@ COPY --chown=customerai:customerai server/src ./src
 COPY --chown=customerai:customerai hermes/ /opt/customer-ai/hermes-config/
 # Container entrypoint + process supervisor.
 COPY --chown=customerai:customerai deploy/blitz/entrypoint.sh /opt/customer-ai/entrypoint.sh
+# entrypoint.sh is committed to git with mode 100644 (non-executable), so COPY
+# preserves a non-executable file and execve() would fail with EACCES
+# ("permission denied"). Make it executable in the image.
+RUN chmod +x /opt/customer-ai/entrypoint.sh
 COPY --chown=customerai:customerai deploy/blitz/supervisor.mjs /app/supervisor.mjs
 # Optional static frontend bundle (Vercel is the real frontend host).
 COPY --from=client-build --chown=customerai:customerai /app/client/dist /app/client/dist
@@ -148,4 +152,10 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/api/health').then(r=>process.exit(r.status===200?0:1)).catch(()=>process.exit(1))"
 
-CMD ["/opt/customer-ai/entrypoint.sh"]
+# The entrypoint is declared in the image (not as a CMD) so the container's
+# startup is owned by this file. ENTRYPOINT also survives an operator-supplied
+# container command: a CMD is replaceable at run time, which is how the shell
+# script ended up being handed to `node` (SyntaxError at entrypoint.sh:2).
+# The script ends with `exec node /app/supervisor.mjs`, so Node becomes PID 1
+# and receives SIGTERM/SIGINT directly.
+ENTRYPOINT ["/opt/customer-ai/entrypoint.sh"]
