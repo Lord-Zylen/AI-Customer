@@ -1,240 +1,238 @@
 ===============================================================================
-CURRENT REPORT — Hermes dashboard reachable on public port 8080
+CURRENT REPORT — Why the Hermes dashboard never bound 9119 (502 at /hermes-dashboard)
 (this file is the only current report; any earlier version is replaced)
 ===============================================================================
-LATEST UPDATE (2026-09-28): IMPLEMENTED AND TESTED. The Hermes dashboard is now
-published on the EXISTING public port 8080 at /hermes-dashboard. Blitz does not
-need a second port. Three files changed, no new dependency:
+LATEST UPDATE (2026-09-28): ROOT CAUSE FOUND AND FIXED. The proxy was never the
+problem — it correctly reported ECONNREFUSED because nothing was listening.
+`hermes dashboard` blocks BEFORE it binds, on a mandatory frontend build that
+can never complete in this image.
 
-  MODIFIED  server/src/server.js                              (3 small edits)
-  NEW       server/src/middleware/hermesDashboardProxy.js      (the proxy)
-  (previous turn, still in place and unchanged this turn:
-           deploy/blitz/supervisor.mjs, Dockerfile)
+  EXACT REASON
+  main_dashboard.py:808 _resolve_dashboard_web_dist() runs before the server is
+  imported, and at line 821-823:
 
-NOT committed. package.json / package-lock.json are UNCHANGED — no proxy library
-was added. Blitz still exposes only 8080. Customer AI still never pairs
-WhatsApp: the proxy only forwards, it adds no pairing and no auth.
+      elif "HERMES_WEB_DIST" not in os.environ and not skip_build:
+          if not _build_web_ui(PROJECT_ROOT / "web", fatal=True):
+              sys.exit(1)
 
-------------------------------------------------------------------------------
-HOW /hermes-dashboard ROUTES TO 9119
-------------------------------------------------------------------------------
-Browser:  https://<blitz-host>/hermes-dashboard
-   -> Customer AI Express (port 8080)
-   -> app.use('/hermes-dashboard', hermesDashboardProxy)   [server.js:7]
-   -> strip the prefix, inject X-Forwarded-Prefix, forward to
-      http://127.0.0.1:9119 via node:http
-   -> Hermes dashboard (FastAPI/uvicorn) responds, response streamed back
+  Our invocation sets neither HERMES_WEB_DIST nor --skip-build, so it takes this
+  branch and performs a MANDATORY, BLOCKING build of the `web` workspace
+  (`npm install` + `tsc -b && vite build`). The image shipped neither
+  hermes_cli/web_dist nor the web workspace's node_modules, so that build could
+  not finish. Uvicorn is never started, port 9119 is never bound, and the
+  Customer AI proxy's upstream connect gets ECONNREFUSED -> 502.
 
-Effective command, for reference:
-  hermes dashboard --host 0.0.0.0 --port 9119 --no-open
-(supervisor.mjs:88-109). The dashboard stays bound to 0.0.0.0:9119 and is
-simply not published by Blitz; the proxy is the only public door to it.
+FIX (Dockerfile only, 2 added statements):
+  RUN npm ci --workspace ui-tui --workspace web --include-workspace-root \
+   && npm run build -w web
+  ENV HERMES_WEB_DIST=/opt/hermes-agent/hermes_cli/web_dist
+With HERMES_WEB_DIST set, main_dashboard.py:853 takes the "caller-managed dist"
+branch and SKIPS the build entirely; web_server.py:58 then serves the SPA from
+that path. No proxy, pairing, auth or supervisor change was needed.
 
-KEY INSIGHT (why this works cleanly): Hermes has FIRST-CLASS reverse-proxy
-sub-path support built in, keyed off one header. Injecting
-`X-Forwarded-Prefix: /hermes-dashboard` makes the dashboard, with no rebuild:
-  - inject window.__HERMES_BASE_PATH__="/hermes-dashboard"
-    (web_server_dashboard.py:140-172) so the SPA builds prefixed URLs;
-  - rewrite the absolute Vite asset URLs baked into index.html —
-    href="/assets/, src="/assets/, /favicon.ico, /fonts/, /ds-assets/
-    (web_server_dashboard.py:163-167);
-  - rewrite url(/fonts/...) etc. inside hashed CSS
-    (web_server_dashboard.py:177-190);
-  - scope session cookies to the prefix: Path=/hermes-dashboard and the
-    __Secure- cookie-name variant (dashboard_auth/cookies.py:47-60);
-  - build prefixed Location headers and OAuth redirect URIs
-    (dashboard_auth/prefix.py).
-The dashboard also rejects '..', '//' and quote/space/CRLF characters in the
-prefix, so a hostile value cannot smuggle HTML or traversal. Our proxy always
-OVERWRITES the header, so a client cannot inject its own prefix.
+NOT committed. Note: commits a51d642 ("chnage") and ea67ea9 ("hermes") were made
+outside this session and contain all previously reported work — verified intact
+in HEAD. Only the Dockerfile edit is uncommitted.
 
 ------------------------------------------------------------------------------
-1. FILES CHANGED
+1. EVIDENCE (everything below was executed, not inferred)
 ------------------------------------------------------------------------------
-A) server/src/middleware/hermesDashboardProxy.js  (NEW, ~30 lines of code)
-   Exports:
-     HERMES_DASHBOARD_PREFIX  = '/hermes-dashboard'
-     hermesDashboardProxy     = Express middleware for normal HTTP
-     attachHermesDashboardProxy(server) = attaches the 'upgrade' handler
-   Behaviour:
-     - Gated on the SAME env flag the container supervisor already uses
-       (HERMES_DASHBOARD = true|1|yes, case-insensitive, default OFF), so the
-       process and the route can never disagree. When unset the middleware calls
-       next() and the upgrade listener is never attached — a total no-op.
-     - Target is 127.0.0.1:${HERMES_DASHBOARD_PORT:-9119}, reusing the
-       Dockerfile:62 default. Loopback only, never a routable address.
-     - Strips the prefix segment-safely (so /hermes-dashboardfoo is NOT matched)
-       and preserves the query string.
-     - Forwards method, body and headers. Bodies are piped as a raw stream.
-     - Sets x-forwarded-prefix (always, overwriting any client value),
-       x-forwarded-host, x-forwarded-proto, x-forwarded-for. Express's
-       req.protocol is preferred for the scheme because app.set('trust proxy')
-       is on, so a client cannot spoof it.
-     - Strips hop-by-hop headers per RFC 9110 7.6.1 (connection, keep-alive,
-       proxy-authenticate, proxy-authorization, te, trailer, transfer-encoding,
-       upgrade) so a client cannot desync the upstream connection.
-     - Rewrites root-relative Location headers to stay inside the prefix
-       (safety net for redirects), and NEVER double-prefixes a Location that
-       Hermes already prefixed.
-     - Upstream unreachable -> 502 with a generic message. The real error
-       (e.g. ECONNREFUSED) is logged server-side only and never returned.
-     - WebSocket support: the dashboard SPA uses /api/ws and /api/pty, so without
-       upgrade proxying the page would load but live updates and the terminal
-       would be dead. The upgrade handler rewrites the 101 response manually and
-       splices both the client's and the upstream's early bytes back onto the
-       socket in the correct order. An upgrade outside the prefix is destroyed,
-       not hijacked.
+REPRODUCED THE SYMPTOM EXACTLY, against the pinned agent (commit 4716ec0, the
+same pin as Dockerfile:48):
+  - `hermes dashboard --host 0.0.0.0 --port 9119 --no-open`
+  - process stays ALIVE (timeout killed it at 40s, exit 124)
+  - stdout: 0 bytes. stderr: 0 bytes.            <- the reported "no output"
+  - `ss -ltn` -> nothing listening on 9119
+  - the process did NOT exit, so the supervisor's exit handler never fired and
+    the container stayed up with a healthy 8080. This matches production.
 
-B) server/src/server.js  (3 edits, all additive)
-   1. +1 import of the three symbols.
-   2. +1 app.use(HERMES_DASHBOARD_PREFIX, hermesDashboardProxy) at line 7, placed
-      deliberately BETWEEN helmet() and cors()/express.json():
-        - AFTER helmet  -> the dashboard still gets the standard security
-          headers (HSTS, X-Frame-Options, nosniff, referrer-policy, ...).
-        - BEFORE express.json() -> CRITICAL. The dashboard's onboarding and
-          auth calls POST JSON; if express.json() had already consumed the body,
-          the proxy would forward an empty body and pairing would silently
-          break. Mounting before it keeps the stream raw.
-        - BEFORE the SPA catch-all app.get(/^(?!\/api).*/) on line 13, which
-          would otherwise answer /hermes-dashboard with Customer AI's
-          index.html.
-      Ordering of every pre-existing middleware is otherwise unchanged.
-   3. Replaced the two inline app.listen() calls with a small serve(message)
-      helper so the http.Server object is available to attach the upgrade
-      handler. Both original log messages (normal and "degraded mode") and the
-      degraded-mode fallback are preserved exactly.
+FOUND WHERE IT BLOCKS, via strace (full syscall trace):
+  - ZERO socket()/bind()/listen()/connect() syscalls were ever issued. It never
+    even attempts to open a listening socket.
+  - The last meaningful syscall before the hang was:
+      openat(".../hermes-agent/.web_ui_build.lock", O_WRONLY|O_CREAT|O_APPEND) = 6
+    after which it blocked indefinitely.
 
-C) Unchanged on purpose: server/package.json, server/package-lock.json (no new
-   dependency — node:http and node:net only), all routes, auth middleware,
-   client code, Dockerfile, supervisor.mjs, entrypoint.sh, render.yaml.
+CONFIRMED THE BUILD IS THE BLOCKER, with the lock removed and --skip-build:
+      ⚠ --skip-build was passed but no web dist found at:
+        /home/alex/.hermes/hermes-agent/hermes_cli/web_dist
+        Attempting one recovery build of the web UI...
+      → Building web UI...
+    ...then it hangs. (main_dashboard.py:832-843: the default dist location is
+    "recoverable", so even --skip-build triggers a real build.)
+  This is the smoking gun, and it also explains the production silence: with the
+  gateway already running, the non-blocking flock FAILS, so control goes to
+  main_web_build.py:416 — a BLOCKING flock(LOCK_EX) — and it never even reaches
+  the "→ Building web UI..." print. Hence: no output at all in production.
+
+CONFIRMED THE DIST PATH AND BUILD OUTPUT:
+  - main_web_build.py:88-90  dist = <project_root>/hermes_cli/web_dist
+                              (NOT web/dist; vite outDir is ../hermes_cli/web_dist)
+  - hermes_cli/web_dist did not exist in the agent
+  - Dockerfile:139 installed ONLY the WhatsApp bridge's node_modules
+    (`npm ci --prefix /opt/hermes-agent/scripts/whatsapp-bridge`); the `web`
+    workspace deps were never installed and no frontend was ever built.
 
 ------------------------------------------------------------------------------
-2. REQUIREMENT-BY-REQUIREMENT
+2. THE TWO-LAYER FAILURE (why it is silent, and why it is fatal)
 ------------------------------------------------------------------------------
-1. Existing routes/middleware preserved — YES. Only an additive app.use in a
-   gap between existing middleware, plus the listen() refactor. helmet, cors,
-   express.json, morgan, rateLimit, all 7 route mounts, the CastError handler,
-   express.static and the SPA fallback are all in their original order. The
-   dashboard sits outside /api, so the /api rate limiter is not applied to it —
-   correct, since the dashboard brings its own (429 paths in
-   dashboard_auth/routes.py).
-2. Assets AND API proxied, not just the HTML — YES. Verified: /assets/*,
-   hashed CSS, /favicon.ico, /fonts/*, JSON POST bodies, /api/* and query
-   strings all forward correctly; WebSocket upgrades too. The SPA catch-all
-   inside the dashboard is reached as / so its own client-side routing works.
-3. Basic Auth preserved — YES. The Authorization header and Cookie header are
-   forwarded byte-for-byte, so HERMES_DASHBOARD_BASIC_AUTH_USERNAME /
-   _PASSWORD remain the only gate. Tested explicitly. Note this Hermes build
-   authenticates via a login page that mints a session cookie, not an HTTP 401
-   Basic challenge; either way the proxy is transparent.
-4. Never exposed unauthenticated — YES, by three layers:
-     a) the route does not exist at all unless HERMES_DASHBOARD is explicitly
-        enabled (same flag the supervisor uses to start the process);
-     b) Hermes itself fails closed on a 0.0.0.0 bind with no auth provider
-        configured, and keeps gating every proxied request;
-     c) no auth was added, removed, short-circuited or bypassed. --insecure is
-        not used. Client IP restriction, if wanted, belongs in front of the
-        whole app, not in this proxy.
-5. No redirect loops; relative paths keep working — YES. X-Forwarded-Prefix
-   makes Hermes generate prefixed URLs itself; the Location rewrite is only a
-   safety net and is explicitly idempotent (an already-prefixed Location is
-   left alone, so there is no /hermes-dashboard/hermes-dashboard/... loop).
-   Cookies are scoped to the prefix, so they cannot collide with the Customer
-   AI session cookie on the same origin.
-6/7. Minimal and targeted — YES. One new 30-line module, one import, one
-   app.use, one listen() refactor. No refactor of unrelated code, no new
-   dependency, no changes to pairing architecture, MongoDB, AI, frontend or
-   business logic.
-8. Not committed — CORRECT, nothing was committed.
+Layer 1 — the lock (main_web_build.py:405-419). Any Hermes process that wants to
+build the web UI takes an flock on <project_root>/.web_ui_build.lock:
+    flock(LOCK_EX | LOCK_NB)
+      success            -> this process builds
+      failure + dist OK  -> serve the existing dist (return True)
+      failure + no dist  -> flock(LOCK_EX)  <-- BLOCKS FOREVER, silently
+The supervisor starts the gateway (supervisor.mjs:159) BEFORE the dashboard
+(:162). The gateway is a Hermes process that can hold that lock, so the dashboard
+hits the third case and waits indefinitely with zero output. Note this is a
+symptom amplifier, not the root cause: with a prebuilt dist the branch is never
+reached at all.
+
+Layer 2 — the build itself cannot succeed in this image. Even holding the lock,
+`_do_build_web_ui` must run `npm install` for the `web` workspace and then
+`npm run build`. The image has no web workspace node_modules, so npm must reach
+the registry at runtime — unavailable/slow in the container, and unbounded, so it
+hangs rather than failing. Note npm's output is only relayed on FAILURE
+(_relay_npm_output is called from _report_web_build_failure), so a hanging build
+is silent by construction.
 
 ------------------------------------------------------------------------------
-3. SECURITY NOTES / TRADE-OFFS
+3. ANSWERS TO THE SPECIFIC QUESTIONS ASKED
 ------------------------------------------------------------------------------
-- ONE deliberate header change: Content-Security-Policy is removed from
-  dashboard responses only. helmet 8.3.0 defaults to `script-src 'self'` with
-  no 'unsafe-inline', which would block the inline bootstrap <script> Hermes
-  injects into index.html (session token + __HERMES_BASE_PATH__). Without the
-  removal the dashboard renders blank. Every other helmet header still applies,
-  and no CSP change was made for any other route. This was the only way to keep
-  helmet active everywhere else.
-- The proxy is same-origin only. It is reachable at /hermes-dashboard on the
-  same public host as the Customer AI app, so anyone who can reach the app can
-  reach the login page. Hermes' gate is the boundary — which is exactly the
-  existing design. If you want a second factor, put Cloudflare Access or an
-  IP allowlist in front of the whole host.
-- The internal upstream is hardcoded to 127.0.0.1, so the dashboard is not
-  reachable from outside the container by any other route.
-- morgan does not log dashboard traffic (it is mounted after the proxy) and the
-  /api rate limiter does not apply to it. If you want pairing attempts visible
-  in the Customer AI logs, the dashboard's own audit log is the place to look.
-- x-forwarded-proto defaults to https when the platform does not send it. That
-  is the stricter choice (Secure/__Secure- cookies). If Blitz forwards it
-  correctly it is used instead. If the chain is ever unreliable, set
-  HERMES_DASHBOARD_PUBLIC_URL to the full public URL including the prefix —
-  that is the official override and it takes precedence.
+* exits immediately?              NO — it stays alive, blocked. That is why the
+                                  container did not restart and 8080 stayed
+                                  healthy.
+* requires a specific env var?    YES — HERMES_WEB_DIST. Setting it makes the
+                                  build a no-op (main_dashboard.py:853) and it
+                                  also makes a missing dist fail fast with
+                                  sys.exit(1) instead of hanging forever.
+* requires a different cwd?       NO — PROJECT_ROOT is derived from the package
+                                  location, not the working directory.
+* requires a frontend/static path? YES — it requires a BUILT dist at
+                                  hermes_cli/web_dist (or at HERMES_WEB_DIST).
+                                  This was the missing piece.
+* requires auth configuration?    Not the cause here — we never got far enough
+                                  to reach the gate. It is still REQUIRED for the
+                                  fix to be usable, since a 0.0.0.0 bind fails
+                                  closed without it. Left mandatory, no
+                                  --insecure, no bypass.
+* writes its error elsewhere?     NO — nothing was written elsewhere. The silence
+                                  is explained by the blocking flock and by npm
+                                  output being relayed only on failure.
+* affected by the gateway env?    YES — the already-running gateway's hold on
+                                  .web_ui_build.lock is what converted a visible
+                                  hang into a completely silent one.
 
 ------------------------------------------------------------------------------
-4. VERIFICATION / TEST MATRIX
+4. SUPERVISOR CHILD-PROCESS HANDLING — VERIFIED, NO CHANGE NEEDED
 ------------------------------------------------------------------------------
-All checks below were actually executed.
-
-PASS  node --check on both changed files; the module imports and exports
-      HERMES_DASHBOARD_PREFIX, hermesDashboardProxy, attachHermesDashboardProxy.
-PASS  12/12 functional tests against a stub upstream that mimics the dashboard
-      (injects __HERMES_BASE_PATH__, rewrites assets, sets a prefixed cookie,
-      emits a root-relative Location, accepts WS upgrades):
-        1  bare /hermes-dashboard maps to upstream "/" and injects
-           __HERMES_BASE_PATH__="/hermes-dashboard"; SPA fallback NOT served
-        2  /hermes-dashboard/assets/index-abc.js?v=1 -> /assets/index-abc.js?v=1
-        3  JSON POST body forwarded intact ({"mode":"qr"}) — proves the
-           before-express.json() mount position is correct
-        4  Location: /login  ->  /hermes-dashboard/login (stays in the proxy)
-        5  Location: /hermes-dashboard/login left unchanged (no double prefix)
-        6  Authorization and Cookie forwarded byte-for-byte (basic auth intact)
-        7  x-forwarded-prefix and x-forwarded-host set by the proxy
-        8  client-supplied x-forwarded-prefix="/evil" overwritten; te and
-           proxy-authorization stripped
-        9  upstream Set-Cookie arrives with Path=/hermes-dashboard
-       10  WebSocket upgrade /hermes-dashboard/api/ws?ticket=t1 -> upstream
-           /api/ws?ticket=t1 and returns 101 with the prefix header
-       11  an upgrade outside the prefix is not proxied
-       12  upstream down -> 502 JSON containing no host, port or ECONNREFUSED
-PASS  3/3 disabled-mode regression tests (HERMES_DASHBOARD unset):
-       /hermes-dashboard falls through to the existing SPA route, /api/health
-       still 200, and no upgrade interception happens. Disabled is a true no-op.
-PASS  Confirmed no proxy library is installed or added; the implementation uses
-      only node:http / node:net. package.json and package-lock.json unchanged.
-PASS  Confirmed helmet 8.3.0's default CSP is script-src 'self' (no
-      'unsafe-inline'), which is what justified removing CSP for this path.
-NOT TESTED  No Docker build and no live Hermes dashboard: this environment has
-      no Docker daemon, so the proxy was exercised against a faithful stub of
-      the dashboard's documented prefix behaviour, not the real FastAPI app.
-      The prefix contract itself is read directly from the pinned agent
-      (web_server_dashboard.py, dashboard_auth/prefix.py, dashboard_auth/
-      cookies.py) at commit 4716ec0, which is the exact Dockerfile pin.
-NOT VERIFIED  Blitz's own header handling (X-Forwarded-Proto) and TLS
-      termination. Confirm in the deployed environment.
+Checked, and it is already correct:
+  - supervisor.mjs:99-100 pipes BOTH stdout and stderr through
+    makeLogger('dashboard'), and registers 'error' and 'exit' handlers, and
+    registers the child in the children Map (:108) for shutdown.
+  - This capture is genuinely required, confirmed empirically: the real dashboard
+    writes "→ Using web dist from HERMES_WEB_DIST: ...", "HERMES_DASHBOARD_READY
+    port=9119" and the JSON-RPC setup.ready event to STDOUT, and
+    "Hermes Web UI → http://0.0.0.0:9119" to STDERR. Both are captured.
+  - The exit handler is correct too: had the dashboard died, `if (!stopping)
+    shutdown(1)` would have restarted the container. It never died, so this path
+    was not exercised. No supervisor change was required or made.
+  - One expectation to record: the dashboard takes ~24-30s to print
+    HERMES_DASHBOARD_READY (plugin/config discovery, not a build). 502s from the
+    proxy in the first ~30s after a container start are therefore expected and
+    self-resolving. Do not add a shorter liveness assumption.
 
 ------------------------------------------------------------------------------
-5. TO ACTUALLY USE IT ON BLITZ
+5. THE FIX
 ------------------------------------------------------------------------------
-Set these service env vars (no port change needed):
-  HERMES_DASHBOARD=true
-  HERMES_DASHBOARD_PORT=9119                (optional; this is the default)
-  HERMES_DASHBOARD_BASIC_AUTH_USERNAME=<user>
-  HERMES_DASHBOARD_BASIC_AUTH_PASSWORD=<strong secret>
-Then open https://<blitz-host>/hermes-dashboard and log in. The dashboard's
-Basic Auth gate cannot be disabled on a 0.0.0.0 bind, and we do not attempt to
-bypass it. Reminder from the previous report: also set WHATSAPP_SETUP_TOKEN —
-server/src/routes/whatsapp.js:4 is fail-open when it is unset (latent; nothing
-sits behind it today, and this change adds nothing).
+Dockerfile, inserted after the WhatsApp bridge npm ci (:139), before the
+`hermes` launcher RUN. Runs as `customerai` (USER at :127) into /opt/hermes-agent
+(chowned to customerai at :108), so no new root-owned tree is introduced.
 
-Pairing remains a ONE-TIME action. After it, creds.json lives at
-/app/data/hermes/platforms/whatsapp/session/creds.json on the persistent disk
-and the gateway reconnects on every restart with no dashboard needed. You can
-turn HERMES_DASHBOARD off afterwards to remove the public door entirely.
+    RUN npm ci --workspace ui-tui --workspace web --include-workspace-root \
+     && npm run build -w web
+    ENV HERMES_WEB_DIST=/opt/hermes-agent/hermes_cli/web_dist
 
-Note (carried over, unchanged): applying a pairing makes Hermes restart the
-gateway (web_server_messaging.py:371-373), which the supervisor reads as an
-unexpected gateway exit -> one container restart, then it comes up paired.
-Self-healing; a clean fix would be out of scope for this change.
+Why this closure: it mirrors hermes_cli/main_web_build.py::_web_npm_install_context
+exactly, which is documented as required — the root package.json workspaces are
+["apps/*","ui-tui","ui-tui/packages/*","web","tests-js"], and that helper returns
+("--workspace","ui-tui","--workspace","web","--include-workspace-root"). A
+narrower install would silently prune deps the build needs (see the #43564/#64354
+note in the source). The build's vite outDir is already ../hermes_cli/web_dist,
+so the output lands exactly where HERMES_WEB_DIST points.
+
+Deliberately NOT changed: the proxy (server/src/middleware/hermesDashboardProxy.js),
+server.js, supervisor.mjs, the pairing architecture, auth, the /api/whatsapp/*
+routes, the frontend, MongoDB, and the dashboard command line itself.
+
+------------------------------------------------------------------------------
+6. VERIFICATION OF THE FIX (all executed against the pinned agent)
+------------------------------------------------------------------------------
+PASS  Ran the exact build steps from the new Dockerfile step on the pinned agent:
+        npm ci --workspace ui-tui --workspace web --include-workspace-root
+          -> NPMCI_EXIT=0
+        npm run build -w web
+          -> "✓ built in 45.58s", BUILD_EXIT=0
+      Produced hermes_cli/web_dist/ containing index.html, assets/, favicon.ico,
+      fonts/, fonts-terminal/ — i.e. every path the dashboard's prefix rewriter
+      handles (web_server_dashboard.py:163-190).
+PASS  THE DASHBOARD NOW BINDS. With HERMES_WEB_DIST set:
+        "→ Using web dist from HERMES_WEB_DIST: .../hermes_cli/web_dist"
+        "HERMES_DASHBOARD_READY port=9119"
+      and `ss -ltn` confirmed a listener on 9119. No npm, no build, no hang.
+PASS  AUTH IS STILL ENFORCED (not weakened to achieve the fix):
+        unauthenticated GET /  ->  302 Location: /login?next=%2F
+PASS  LOGIN WORKS with the configured basic-auth credentials:
+        POST /auth/password-login {"provider":"basic","username":...,"password":...}
+        -> 200 {"ok":true,"next":"/"}
+      Sets __Secure-hermes_session_at / _rt / _provider, all HttpOnly,
+      SameSite=lax, Secure, and — importantly — Path=/hermes-dashboard.
+PASS  THE REAL DASHBOARD CONFIRMS THE PROXY'S PREFIX CONTRACT. Authenticated
+      GET / with `X-Forwarded-Prefix: /hermes-dashboard` returned 200 with:
+        window.__HERMES_BASE_PATH__ = "/hermes-dashboard"
+        src="/hermes-dashboard/assets/index-<hash>.js"
+        href="/hermes-dashboard/favicon.ico"
+      So the absolute Vite asset URLs really are rewritten to route back through
+      the Customer AI proxy. This validates the proxy design from the previous
+      report against the live app rather than a stub.
+NOTE  Replaying the session cookie by hand was needed only because curl will not
+      return a `Secure` cookie over plain http. In production Blitz terminates
+      TLS and the browser sends it normally. Not a defect.
+
+------------------------------------------------------------------------------
+7. TRADE-OFFS / THINGS TO EXPECT
+------------------------------------------------------------------------------
+- IMAGE SIZE AND BUILD TIME INCREASE. This is the unavoidable cost of a working
+  dashboard UI: the `web` workspace node_modules plus the built dist. Measured
+  locally, npm ci ~90s and vite build ~105s, so expect the Docker build to grow
+  by a few minutes. I did not prune dev dependencies afterwards: it would shrink
+  the image but risks removing something the dashboard needs, and minimality was
+  the priority. Easy to revisit.
+- The dashboard needs ~24-30s to become ready after the container starts. The
+  proxy will return 502 during that window; this is expected, not a regression.
+- HERMES_DASHBOARD still must be enabled for the supervisor to start the process,
+  and HERMES_DASHBOARD_BASIC_AUTH_USERNAME / _PASSWORD remain mandatory. With the
+  fix in place the dashboard now fails FAST and loudly if the dist is missing
+  (sys.exit(1)) instead of hanging — a strictly better failure mode.
+- A fresh `npm ci` runs at image build. If the web sources change, rebuild the
+  image; there is no runtime rebuild path any more, which is the point.
+- The gateway's .web_ui_build.lock is now irrelevant to the dashboard, since the
+  build path is never entered. No lock cleanup or stale-lock handling is needed.
+
+------------------------------------------------------------------------------
+8. OUTSTANDING (unchanged, not part of this fix)
+------------------------------------------------------------------------------
+- The /api/health 503 (MongoDB) and the ADMIN password items are still open and
+  unrelated.
+- server/src/routes/whatsapp.js:4 requireSetupToken is still fail-open when
+  WHATSAPP_SETUP_TOKEN is unset (latent; nothing sits behind it). Set it.
+- Applying a pairing still makes Hermes restart the gateway
+  (web_server_messaging.py:371-373), which the supervisor reads as an unexpected
+  gateway exit -> one container restart, then it comes up paired. Self-healing.
+- WHATSAPP_AUTH_DIR is still documented but never read by Hermes; real
+  credentials live at
+  /app/data/hermes/platforms/whatsapp/session/creds.json.
+- Not verified on the real Blitz image: this fix was validated on the pinned
+  agent at commit 4716ec0 on this machine, not inside the built container. The
+  Dockerfile step is the same command that was run successfully here.
+===============================================================================
