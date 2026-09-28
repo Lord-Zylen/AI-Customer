@@ -3,6 +3,8 @@
 //
 // Starts the Customer AI Node backend, waits for /api/health, then starts the
 // Hermes gateway (which spawns the WhatsApp Baileys bridge as its own child).
+// Optionally starts the Hermes dashboard, which provides the WhatsApp pairing
+// (QR) flow for platforms with no interactive console.
 // - propagates SIGTERM/SIGINT/SIGHUP to both children (gateway first, so it
 //   can flush the WhatsApp session; backend second)
 // - exits non-zero if either critical service dies unexpectedly
@@ -15,7 +17,13 @@ import { spawn } from 'node:child_process';
 
 const HERMES_AGENT_DIR = '/opt/hermes-agent';
 const GATEWAY_PY = '/opt/hermes-agent/venv/bin/python';
+const HERMES_BIN = process.env.HERMES_BIN || '/home/customerai/.local/bin/hermes';
 const HERMES_ENABLED = String(process.env.HERMES_ENABLED ?? 'true').toLowerCase() !== 'false';
+// Opt-in (default off). The dashboard binds 0.0.0.0, so Hermes requires an auth
+// provider (HERMES_DASHBOARD_BASIC_AUTH_* or HERMES_DASHBOARD_OAUTH_CLIENT_ID)
+// to be configured or it refuses to start.
+const HERMES_DASHBOARD_ENABLED = /^(true|1|yes)$/i.test(String(process.env.HERMES_DASHBOARD ?? '').trim());
+const HERMES_DASHBOARD_PORT = Number(process.env.HERMES_DASHBOARD_PORT || 9119);
 const PORT = process.env.PORT || 8080;
 const BACKEND_WAIT_MS = Number(process.env.BACKEND_WAIT_MS || 120000);
 const HEALTH_POLL_MS = 1000;
@@ -74,6 +82,34 @@ function startGateway() {
   return child;
 }
 
+// Third supervised child. Serves the Hermes dashboard, whose WhatsApp onboarding
+// endpoints return the pairing QR as JSON. Runs only when explicitly enabled and
+// authenticates with the normal Hermes dashboard auth (never --insecure).
+function startDashboard() {
+  log('supervisor', `starting Hermes dashboard (hermes dashboard, port ${HERMES_DASHBOARD_PORT})`);
+  const child = spawn(
+    HERMES_BIN,
+    ['dashboard', '--host', '0.0.0.0', '--port', String(HERMES_DASHBOARD_PORT), '--no-open'],
+    {
+      cwd: HERMES_AGENT_DIR,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
+  child.stdout.on('data', makeLogger('dashboard'));
+  child.stderr.on('data', makeLogger('dashboard'));
+  child.on('error', (err) => {
+    log('supervisor', `Hermes dashboard spawn error: ${err.message}`);
+    shutdown(1);
+  });
+  child.on('exit', (code, signal) => {
+    log('supervisor', `Hermes dashboard exited (code=${code}, signal=${signal})`);
+    if (!stopping) shutdown(1);
+  });
+  children.set('dashboard', child);
+  return child;
+}
+
 async function waitForBackend() {
   const deadline = Date.now() + BACKEND_WAIT_MS;
   while (Date.now() < deadline) {
@@ -123,6 +159,7 @@ function shutdown(exitCode) {
   stopping = true;
   log('supervisor', `shutting down (container exit code ${exitCode})`);
   const gateway = children.get('gateway');
+  const dashboard = children.get('dashboard');
   const backend = children.get('backend');
   (async () => {
     // Gateway first: its graceful shutdown flushes the WhatsApp session.
@@ -132,6 +169,13 @@ function shutdown(exitCode) {
         gateway.kill('SIGTERM');
       } catch { /* already gone */ }
       await waitExit(gateway, GATEWAY_GRACE_MS);
+    }
+    if (dashboard && dashboard.exitCode === null) {
+      log('supervisor', `sending SIGTERM to Hermes dashboard (pid ${dashboard.pid})`);
+      try {
+        dashboard.kill('SIGTERM');
+      } catch { /* already gone */ }
+      await waitExit(dashboard, BACKEND_GRACE_MS);
     }
     if (backend && backend.exitCode === null) {
       log('supervisor', `sending SIGTERM to Customer AI backend (pid ${backend.pid})`);
@@ -157,6 +201,11 @@ if (!healthy) {
   shutdown(1);
 } else if (HERMES_ENABLED) {
   startGateway();
+  if (HERMES_DASHBOARD_ENABLED) {
+    startDashboard();
+  } else {
+    log('supervisor', 'HERMES_DASHBOARD is not enabled — skipping the Hermes dashboard');
+  }
 } else {
   log('supervisor', 'HERMES_ENABLED=false — skipping Hermes gateway (backend only)');
 }
