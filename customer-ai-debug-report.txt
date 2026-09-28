@@ -1,165 +1,192 @@
 ===============================================================================
-CURRENT REPORT — Production deployment preparation (Render + Vercel)
+CURRENT REPORT — Docker container startup fix (Node SyntaxError on entrypoint)
 (this file is the only current report; any earlier version is replaced)
 ===============================================================================
-LATEST UPDATE (2026-09-23): Repository prepared for production deployment:
-Vercel SPA frontend + single Render Docker web service (Node backend + Hermes
-gateway + WhatsApp bridge) + external MongoDB Atlas + Redis Cloud. Preparation
-ONLY — no business logic, AI/Hermes guardrails, or architecture redesign.
-Nothing deployed. Nothing committed/pushed (HEAD 23a0c49).
+LATEST UPDATE (2026-09-28): Container startup failure fixed. The container was
+handing the shell script deploy/blitz/entrypoint.sh to Node.js, producing
+"SyntaxError: Invalid or unexpected token" at entrypoint.sh:2 and an immediate
+exit. Fixed in the image only (Dockerfile). No business logic, Hermes/WhatsApp
+code, env vars, ports, or persistence config changed. Nothing deployed.
+Nothing committed/pushed (HEAD 1aa83db; only the Dockerfile is modified in the
+working tree).
 
-================================================================================
+===============================================================================
 1. FILES CHANGED (this task)
-================================================================================
-- .env.example                     rewritten as safe Render template (same var
-                                   names; no secrets; CAI_HOOK_BASE_URL optional
-                                   since entrypoint derives it from $PORT)
-- Dockerfile                       Render-targeted: HERMES_HOME=/app/data/hermes,
-                                   WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth,
-                                   removed hardcoded CAI_HOOK_BASE_URL + VOLUME
-                                   (Render disk mounts /app/data), pre-created /
-                                   customerai-owned /app/data paths, Hermes pin
-                                   4716ec0... unchanged, non-root uid 1000 kept
-- deploy/blitz/entrypoint.sh       Render: persists under /app/data, derives
-                                   CAI_HOOK_BASE_URL from $PORT, ownership-aware
-                                   mkdir with fail-fast message on disk problems
-- deploy/blitz/supervisor.mjs      header comment only (behavior unchanged)
-- server/src/server.js             graceful shutdown now closes MongoDB AND Redis
-                                   (SIGTERM/SIGINT); connection string redacted
-                                   in Mongo connect error logs
-- server/src/services/database.service.js  added closeDatabase()
-- docker-compose.yml               rebuilt as local container harness: external
-                                   Atlas+Redis via .env, port 5000:5000,
-                                   persistent named volumes for /app/data/hermes
-                                   + /app/data/whatsapp-auth; removed legacy
-                                   bundled mongo (prod never runs a datastore)
-- render.yaml                      (NEW) Blueprint: Docker web service, health
-                                   check /api/health, persistent disk @ /app/data
-- README.md                        Render + Vercel deployment section added as
-                                   primary; Blitz section demoted to legacy
-- client/.env.example              points VITE_API_URL at Render backend
+===============================================================================
+- Dockerfile                       (2 changes, +11/-1, uncommitted)
+                                      a) ADDED  RUN chmod +x
+                                         /opt/customer-ai/entrypoint.sh
+                                         (immediately after the COPY)
+                                      b) CHANGED CMD
+                                         ["/opt/customer-ai/entrypoint.sh"]
+                                         -> ENTRYPOINT
+                                         ["/opt/customer-ai/entrypoint.sh"]
+                                    plus a missing trailing newline at EOF
 
-Also present but from the PREVIOUS task (frontend redesign, uncommitted):
-client/src redesign (AppLayout, pages, CSS), plus earlier fixes
-(redis.service.js, seed.js admin fix, login hardening). All uncommitted.
+NOT CHANGED: deploy/blitz/entrypoint.sh, deploy/blitz/supervisor.mjs,
+server/src/**, hermes/**, docker-compose.yml, render.yaml, client/**,
+.env.example. Verified byte-identical / unmodified.
 
-================================================================================
-2. ARCHITECTURE (as prepared)
-================================================================================
-Vercel (client/, SPA, vercel.json rewrite) -> VITE_API_URL=https://<render>/api
-  -> Render Docker web service (one container):
-     deploy/blitz/entrypoint.sh -> deploy/blitz/supervisor.mjs
-       1. prepare /app/data paths + idempotent Hermes first-boot seeding
-       2. start Node backend (HOST=0.0.0.0, $PORT from Render)
-       3. wait /api/health == 200 (needs MongoDB reachable, else exit 1)
-       4. start Hermes gateway (spawns WhatsApp Baileys bridge)
-  -> MongoDB Atlas + Redis Cloud (external, never in the container)
-Same container is required because human-queue sends invoke local `hermes send`.
-Hermes remains the only WhatsApp transport owner; /api/whatsapp/* are 409.
+===============================================================================
+2. ROOT CAUSE (two independent defects, not one)
+===============================================================================
+The reported error signature was confirmed by reproduction:
+`node deploy/blitz/entrypoint.sh` yields exactly
+    /opt/customer-ai/entrypoint.sh:2
+    # ============================================================================
+    ^
+    SyntaxError: Invalid or unexpected token
+i.e. the script reached Node as a JavaScript file.
 
-================================================================================
-3. RENDER CONFIG (render.yaml)
-================================================================================
-- type: web, runtime: docker, dockerfilePath: ./Dockerfile, dockerContext: .
-- healthCheckPath: /api/health
-- disk: whatsapp-persistent-data, mountPath: /app/data, sizeGB: 1
-- Render injects PORT; image fallback 8080; HOST=0.0.0.0 (ENV)
-- Secrets set ONLY in dashboard (never in render.yaml/.env.example/git)
-- Render shell is used for the one-time WhatsApp pairing (session persists on
-  the /app/data disk; survives restarts)
+(a) THE REPORTED SyntaxError — an operator-supplied container command replaced
+    the image's CMD with `node /opt/customer-ai/entrypoint.sh`.
+    The committed Dockerfile used CMD, which is REPLACEABLE at run time. The
+    override most likely comes from a Render dashboard START COMMAND
+    (dockerCommand) set on the service. render.yaml declares no dockerCommand,
+    so a previously saved dashboard override still applies and wins over the
+    image CMD. This could NOT have come from the Dockerfile: every version in
+    git history was checked and none ever contained
+    `CMD ["node", ".../entrypoint.sh"]` (HEAD was also verified clean).
+    -> Fixed by declaring the entrypoint via ENTRYPOINT in the image. ENTRYPOINT
+       is not replaceable by a plain command override, so the image now owns
+       container startup.
 
-================================================================================
-4. VERCEL CONFIG
-================================================================================
-- Root Directory: client; Build: npm run build; Output: dist
-- Env: VITE_API_URL=https://<render-backend-public-url>/api (public, build-time)
-- client/vercel.json keeps the SPA rewrite (paths -> /index.html); frontend only
+(b) A SECOND, INDEPENDENT BLOCKER — the entrypoint was never made executable.
+    deploy/blitz/entrypoint.sh is committed with git mode 100644
+    (confirmed via `git ls-files -s`), and the Dockerfile had no chmod for it
+    (only the `hermes` launcher got one). COPY preserves a non-executable file,
+    so execve() of the entrypoint fails with EACCES. Reproduced:
+    `./entrypoint.sh` at mode 0644 -> "Permission denied".
+    Consequence: fixing ONLY the CMD->ENTRYPOINT swap would still have left the
+    container dead with "permission denied" instead of the SyntaxError.
+    -> Fixed by `RUN chmod +x /opt/customer-ai/entrypoint.sh`. The file is
+       deliberately left 100644 in git; the mode is set in the image.
 
-================================================================================
-5. ENVIRONMENT VARIABLE CHECKLIST (names ONLY — set real values in Render/Vercel)
-================================================================================
-Backend + Hermes (Render service env):
-NODE_ENV, HOST, PORT (Render-reserved, auto), TRUST_PROXY, MONGODB_URI,
-REDIS_URL, REDIS_QUEUE_TTL, REDIS_PROCESSING_TTL, REDIS_HUMAN_TTL,
-REDIS_RATE_LIMIT, REDIS_RATE_WINDOW_SEC, SESSION_SECRET, AI_API_KEY, AI_MODEL,
-AI_CONFIDENCE_THRESHOLD, HERMES_ENABLED, HERMES_HOME, HERMES_GATEWAY_STATE,
-HERMES_BIN, HERMES_STATE_STALE_MS, WHATSAPP_AUTH_DIR, CAI_HOOK_SECRET,
-CAI_HOOK_BASE_URL (optional; derived from $PORT), CLIENT_ORIGIN, ADMIN_EMAIL,
-ADMIN_PASSWORD, SEED_PRINT_CREDENTIALS, SEED_DEMO, WHATSAPP_SETUP_TOKEN,
-GROQ_API_KEY, WHATSAPP_ENABLED, WHATSAPP_ALLOW_ALL_USERS, WHATSAPP_ALLOWED_USERS,
-WHATSAPP_HOME_CHANNEL
-Vercel: VITE_API_URL
+===============================================================================
+3. DOCKERFILE — FINAL STARTUP CONFIGURATION
+===============================================================================
+COPY --chown=customerai:customerai deploy/blitz/entrypoint.sh \
+     /opt/customer-ai/entrypoint.sh
+RUN chmod +x /opt/customer-ai/entrypoint.sh
+...
+ENTRYPOINT ["/opt/customer-ai/entrypoint.sh"]
 
-================================================================================
-6. PERSISTENT STORAGE (confirmation)
-================================================================================
-- Render Persistent Disk mounts at /app/data (render.yaml disk.mountPath)
-- $HERMES_HOME=/app/data/hermes  -> Hermes config/state/logs & pairing/session
-- $WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth
-- Old Blitz path /home/customerai/.hermes fully replaced; anonymous VOLUME removed
-- On an empty disk the entrypoint seeds config.yaml, customer-ai-gate plugin and
-  customer_ai_tap hook once (idempotent); live dev ~/.hermes is never copied in
-- Disk is NOT backed up by Render -> export it for redundancy
+- ENTRYPOINT target matches the COPY destination exactly.
+- No CMD remains at image level; the only CMD left in the file is the
+  HEALTHCHECK probe (shell form), which is unrelated to container startup.
+- No `node <script>.sh` construct remains anywhere in the repo.
+- Heredoc/exec form (JSON array) is used, so no shell is interposed by Docker
+  and the kernel resolves the script's shebang directly.
 
-================================================================================
-7. TEST MATRIX
-================================================================================
-PASS  node --check: server.js, database.service.js, redis.service.js,
-      whatsapp.service.js, routes (system/auth/hermes/whatsapp), seed.js
+===============================================================================
+4. WHAT WAS DELIBERATELY LEFT UNCHANGED
+===============================================================================
+- SHEBANG: kept `#!/usr/bin/env bash` (not switched to #!/bin/sh). The script
+  has no other bash-only syntax (no [[ ]], no =~, no arrays, no local/source);
+  its single non-POSIX dependency is `set -euo pipefail` (pipefail is not in
+  POSIX; dash only gained it in 0.5.12). bash is an essential package and is
+  always present in node:22-bookworm-slim, and this is the already-validated
+  shebang, so it was not churned during a startup-outage fix.
+- SERVER ENTRY POINT: `exec node /app/supervisor.mjs` was already correct and
+  is unchanged. It uses `exec`, so Node becomes PID 1 and receives
+  SIGTERM/SIGINT/SIGHUP directly. The supervisor then spawns the real server
+  entry point `src/server.js` with cwd=/app/server.
+- CRLF LINE ENDINGS: entrypoint.sh already has 0 CR bytes (LF only). No fix was
+  needed; checked with `grep -c $'\r'` and `od -c` on the first bytes.
+- PERSISTENCE: HERMES_HOME=/app/data/hermes, WHATSAPP_AUTH_DIR=
+  /app/data/whatsapp-auth, the /app/data pre-creation + chown, and the
+  deliberate absence of VOLUME (Render mounts a disk at /app/data) are all
+  unchanged.
+- HERMES + WHATSAPP: untouched. The gateway, the customer-ai-gate plugin, the
+  customer_ai_tap hook, first-boot seeding, the `hermes` launcher, the pinned
+  commit 4716ec0..., and the Baileys bridge npm ci are all intact.
+- Env vars, EXPOSE 8080, HOST/PORT handling, HEALTHCHECK, docker-compose.yml
+  and render.yaml: unchanged.
+- Non-root uid/gid 1000 (USER customerai) and the persistent-disk ownership
+  handling: unchanged.
+
+===============================================================================
+5. VERIFICATION / TEST MATRIX
+===============================================================================
+PASS  Reproduced the reported error: `node entrypoint.sh` -> "SyntaxError:
+      Invalid or unexpected token" at line 2 (byte-identical to the report)
+PASS  Reproduced the second failure mode: executing the 0644 script ->
+      "Permission denied" (confirms defect 2b was real, not theoretical)
+PASS  Full exec chain via host simulation, using the REAL entrypoint.sh with
+      only the two host-unwritable hardcoded paths redirected (/app/data,
+      seed dir), invoked by DIRECT execve (not `bash script`) so the kernel
+      shebang resolution was exercised:
+        shebang resolved -> env/HOME/PORT/HOST prep ->
+        CAI_HOOK_BASE_URL derived http://127.0.0.1:8080 ->
+        persistence dirs created -> first-boot seeding of config.yaml +
+        customer-ai-gate plugin + customer_ai_tap hook ->
+        "starting supervisor" -> exec node supervisor -> stub PID1 alive
+      No SyntaxError; exit path clean.
 PASS  bash -n deploy/blitz/entrypoint.sh
-PASS  docker compose config -q (client-side validation)
-PASS  render.yaml YAML parse (PyYAML)
-PASS  client `vite build` (1903 modules, 326 kB JS / 36 kB CSS gzip'd)
-PASS  Local production-mode boot (NODE_ENV=production, port 5056) against REAL
-      Atlas + Redis Cloud: /api/health -> 200 {"mongodb":"CONNECTED",
-      "redis":"CONNECTED"}; /api/system/status -> backend/mongodb/redis CONNECTED,
-      groq CONFIGURED, hermes+whatsapp CONNECTED (real local gateway running);
-      POST /api/auth/login -> 200 with valid JWT (credentials verified, not printed)
-PASS  Fresh-disk behaviour: HERMES_HOME pointed at an empty dir ->
-      /api/system/status still 200, hermes/whatsapp "NOT CONNECTED", backend/
-      mongodb/redis CONNECTED (graceful degradation, as on first Render boot)
-PASS  CAI_HOOK_BASE_URL derivation: PORT=10000 -> http://127.0.0.1:10000;
-      explicit env value wins
-PASS  Redaction: Mongo connect errors strip user:pass from connection strings
-PASS  Security: rg over tracked files shows no API keys/private keys; .gitignore
-      covers .env/.env.* (exceptions: examples); .dockerignore excludes .env* and
-      local sessions; no secret values in .env.example/render.yaml
-NOT TESTED  docker build/test-run in THIS environment: daemon unreachable
-      (permission denied on /var/run/docker.sock, uid 1000, no passwordless
-      sudo). The Dockerfile/compose are validated syntactically; the image build
-      must be run by the user (see #9) or in CI.
-NOT TESTED  Real Render deploy + WhatsApp pairing on Render (requires account)
+PASS  node --check deploy/blitz/supervisor.mjs
+PASS  CRLF: 0 CR bytes in entrypoint.sh
+PASS  Git mode audit: `git ls-files -s` shows 100644 (chmod done in-image)
+PASS  Repo-wide grep: no `node <script>.sh` / ENTRYPOINT-vs-COPY mismatch
+PASS  Dockerfile structural check: single ENTRYPOINT, no stray image CMD,
+      ENTRYPOINT path == COPY destination, HEALTHCHECK untouched
+NOT TESTED  docker build / container run in THIS environment: daemon
+      unreachable (permission denied on /var/run/docker.sock, which is
+      srw-rw---- root root; uid 1000, no passwordless sudo). The image build
+      is therefore NOT verified end-to-end and must be run by the user (see
+      #6) or in CI. Syntax was validated structurally, not by the daemon.
+NOT TESTED  Real Render deploy + WhatsApp pairing (requires account).
 
-================================================================================
-8. BLOCKERS / RISKS
-================================================================================
-- Docker daemon unavailable in this workspace -> Docker build not executable here
-- Render persistent-disk file ownership at first mount: entrypoint fails fast with
-  an explicit message if /app/data is not writable by uid 1000; fix ownership if
-  it happens (only affects first provisioning)
-- Dev backend on 127.0.0.1:5000 was NOT running at report time (the local Hermes
-  gateway/bridge still is). Pre-existed this task; restart with `npm run dev` to
-  resume local development. Not auto-restarted here.
-- No browser in this environment -> visual/E2E check of the built SPA still manual
-- sed_masked MONGODB_URI dump earlier showed part of the Atlas URI in shell
-  output; it is a real secret - rotate if concerned (credentials live only in .env)
+===============================================================================
+6. TEST / DEPLOY ORDER (manual)
+===============================================================================
+1. CLEAR the Render START COMMAND first. In the dashboard set the service's
+   start command / dockerCommand back to empty (image default). A saved
+   override takes precedence over the image ENTRYPOINT and would reintroduce
+   the exact reported SyntaxError even after this fix.
+2. Build and run locally/CI:
+     docker build -t customer-ai-render:test . && \
+     docker run --rm --name cai -p 8080:8080 \
+       -e NODE_ENV=production -e HOST=0.0.0.0 -e PORT=8080 -e TRUST_PROXY=1 \
+       -e MONGODB_URI=<atlas-uri> -e REDIS_URL=<redis-cloud-url> \
+       -e CLIENT_ORIGIN=https://<vercel-domain> -e CAI_HOOK_SECRET=<secret> \
+       -e SESSION_SECRET=<secret> -e AI_API_KEY=<secret> \
+       customer-ai-render:test
+   EXPECT: "[customer-ai] entrypoint: starting supervisor" then
+   "[supervisor] starting Customer AI backend" — and NO SyntaxError.
+   /api/health is DB-backed: 200 only when MongoDB is reachable, otherwise 503
+   and the supervisor exits after BACKEND_WAIT_MS.
+3. Optional: verify image metadata — `docker inspect` should show
+   Entrypoint ["/opt/customer-ai/entrypoint.sh"].
+4. Deploy the Render Blueprint (render.yaml) and confirm the container reaches
+   /api/health 200 (not a crash loop).
+5. Render shell: pair WhatsApp via the `hermes gateway` flow -> confirm the
+   session dir appears under /app/data/hermes/whatsapp.
+6. Send a real WhatsApp message; confirm the gate allows, the AI replies, and
+   the human-queue route works.
+7. Deploy Vercel: root client, VITE_API_URL=https://<render>/api, build
+   /output as above; set/confirm CLIENT_ORIGIN and CORS.
+8. Smoke-test dashboard, conversations, human-queue reply (hermes send),
+   settings.
 
-================================================================================
-9. DEPLOYMENT ORDER (manual)
-================================================================================
-1. Set secrets in Render: MONGODB_URI, REDIS_URL, SESSION_SECRET, AI_API_KEY,
-   GROQ_API_KEY, CAI_HOOK_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD, CLIENT_ORIGIN
-   (CLIENT_ORIGIN=https://<vercel-domain>, set after Vercel deploy if needed)
-2. Deploy via render.yaml Blueprint (or Docker service): root repo, Persistent
-   Disk mounted at /app/data. Confirm container boots to healthy (/api/health).
-3. Render shell: pair WhatsApp via `hermes gateway` flow -> verify session dir
-   appears under /app/data/hermes/whatsapp.
-4. Send a real WhatsApp message; confirm gate allows + AI reply + human-queue
-   route.
-5. Deploy Vercel: root client, VITE_API_URL=https://<render>/api, build+output
-   as in #4.
-6. Set/confirm CLIENT_ORIGIN and CORS; smoke-test dashboard, conversations,
-   human-queue reply (hermes send), settings.
-7. (Optional) docker build -t customer-ai-render:test . locally/CI and confirm
-   HEALTHCHECK + supervisor logs ([backend]/[hermes]/[supervisor]).
-================================================================================
+===============================================================================
+7. BLOCKERS / RISKS
+===============================================================================
+- BLOCKER (must clear before deploy): a Render dashboard start-command override
+  may still be active. It overrides the image ENTRYPOINT and reproduces the
+  original SyntaxError. This is the single most likely reason the reported
+  error occurred; it cannot be fixed from the repo, only in the dashboard.
+- BLOCKER: Docker build is unverified in this workspace (daemon unreachable).
+  Run #6.2 before deploying.
+- PRE-EXISTING: render.yaml still carries the placeholder repo URL
+  https://github.com/<account>/AI-Customer — replace with the real Git remote
+  for Blueprint deploys.
+- PRE-EXISTING: Render persistent-disk ownership on first mount. The entrypoint
+  fails fast with an explicit message if /app/data is not writable by uid 1000;
+  fix ownership if it occurs (first provisioning only).
+- PRE-EXISTING: the Render disk is NOT backed up by Render — export it for
+  redundancy.
+- PRE-EXISTING: an earlier Atlas URI fragment was exposed in local shell output
+  via a sed_masked dump; credentials live only in .env. Rotate if concerned.
+- The chmod is applied in the image, so a future `git checkout` that resets the
+  file mode back to 100644 is harmless — the RUN chmod still runs at build time.
+  Do not "optimize" it away.
