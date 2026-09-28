@@ -151,7 +151,21 @@ RUN npm ci --prefix /opt/hermes-agent/scripts/whatsapp-bridge
 # The workspace closure mirrors hermes_cli/main_web_build.py::_web_npm_install_context
 # (ui-tui + web + --include-workspace-root); the build's vite outDir is already
 # ../hermes_cli/web_dist. Runs as customerai (USER above) into the chowned agent dir.
-RUN npm ci --workspace ui-tui --workspace web --include-workspace-root \
+#
+# --include=dev is REQUIRED and is not optional politeness. This image sets
+# NODE_ENV=production (line 52) for the Node server runtime, and npm treats that as
+# omit=dev. The web build toolchain lives in web's devDependencies (typescript,
+# vite, @vitejs/plugin-react, @rolldown/plugin-babel, vitest, @types/node,
+# @types/qrcode), so without this flag the install succeeds but silently prunes
+# them: `added 356 packages` instead of the full tree, then `tsc -b` fails with
+# ~91 errors (TS2307 "Cannot find module 'vitest'", TS2591 "Cannot find name
+# 'node:fs'", TS2304 "Cannot find name '__dirname'", TS7016 qrcode, ...).
+# Hermes hits the same trap and guards against it the same way:
+# main_web_build.py::_run_npm_install_deterministic() always appends --include=dev
+# to every npm invocation (main_web_build.py:335), and its docstring says so
+# explicitly ("an inherited NODE_ENV=production / omit=dev silently skips the
+# build toolchain and the build dies"). This flag keeps the two installs identical.
+RUN npm ci --workspace ui-tui --workspace web --include-workspace-root --include=dev \
  && npm run build -w web
 ENV HERMES_WEB_DIST=/opt/hermes-agent/hermes_cli/web_dist
 

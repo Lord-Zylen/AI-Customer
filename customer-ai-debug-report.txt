@@ -1,11 +1,60 @@
 ===============================================================================
-CURRENT REPORT — Why the Hermes dashboard never bound 9119 (502 at /hermes-dashboard)
+CURRENT REPORT — Hermes dashboard 502 / web build failure
 (this file is the only current report; any earlier version is replaced)
 ===============================================================================
-LATEST UPDATE (2026-09-28): ROOT CAUSE FOUND AND FIXED. The proxy was never the
-problem — it correctly reported ECONNREFUSED because nothing was listening.
-`hermes dashboard` blocks BEFORE it binds, on a mandatory frontend build that
-can never complete in this image.
+LATEST UPDATE (2026-09-28, 2nd pass): The prebuild step I added did not build on
+Blitz. `npm ci` succeeded but `tsc -b` failed with 91 errors. Reproduced the
+failure exactly and found the cause: the build was missing devDependencies,
+because our own Dockerfile sets NODE_ENV=production. Fixed by adding ONE npm flag.
+This is a second, independent bug — the first one (dashboard blocking before it
+binds) was real and is still what caused the 502; the second is what stopped the
+prebuilt dist from being produced in the first place.
+
+  ISSUE 2 (this pass) — web build fails, missing modules
+  ROOT CAUSE: `ENV NODE_ENV=production` at Dockerfile:52. npm treats
+  NODE_ENV=production as omit=dev, so the install silently pruned every
+  devDependency. The web build toolchain is declared as devDependencies
+  (web/package.json): typescript 6.0.3, vite 8.2.0, @vitejs/plugin-react 6.0.3,
+  vitest 4.1.10, @rolldown/plugin-babel 0.2.3, @types/node 22.20.1, and
+  @types/qrcode. `npm ci` therefore exits 0 having installed a partial tree
+  (exactly 356 packages), and only the subsequent `tsc -b` reveals the damage.
+
+  WHY 356 PACKAGES: that is the non-dev subset of the tree reachable from the
+  three selected workspaces. The full closure is 551 packages. Nothing is
+  "missing from the lockfile" — every missing module is present in
+  package-lock.json and correctly marked dev:true, e.g.
+      web/node_modules/@rolldown/plugin-babel  [dev]
+      node_modules/vitest                      [dev]
+      node_modules/@vitejs/plugin-react        [dev]
+      node_modules/@types/qrcode               [dev]
+  dev:true entries are omitted under NODE_ENV=production. The packages still
+  present (vite, typescript, qrcode) are only there because they are hoisted
+  prod copies required by OTHER workspaces in the closure — which is why tsc
+  itself could RUN and then failed to resolve things.
+
+  Hermes hits this exact trap and guards against it the same way we now do.
+  main_web_build.py:313-341, _run_npm_install_deterministic(), docstring:
+      "--include=dev is forced: an inherited NODE_ENV=production / omit=dev
+       silently skips the build toolchain and the build dies with tsc: not found"
+  and line 335 appends --include=dev to EVERY npm invocation it makes. My
+  original Dockerfile line reproduced the command but dropped that flag.
+
+  FIX (one flag, Dockerfile only):
+      RUN npm ci --workspace ui-tui --workspace web --include-workspace-root --include=dev \
+       && npm run build -w web
+
+  NO package.json / package-lock.json CHANGE IS NEEDED OR MADE. The lockfile is
+  correct and self-consistent; the install was simply being told to skip half of
+  it. Nothing added to the Customer AI project either — this is entirely inside
+  the pinned Hermes image. No audit fix, no tsconfig relaxation, no test removal,
+  no skipLibCheck, no vendored dist.
+
+------------------------------------------------------------------------------
+ISSUE 1 (earlier pass) — the 502: dashboard never bound 9119
+------------------------------------------------------------------------------
+The proxy was never the problem — it correctly reported ECONNREFUSED because
+nothing was listening. `hermes dashboard` blocks BEFORE it binds, on a mandatory
+frontend build that can never complete in this image.
 
   EXACT REASON
   main_dashboard.py:808 _resolve_dashboard_web_dist() runs before the server is
@@ -21,9 +70,12 @@ can never complete in this image.
   hermes_cli/web_dist nor the web workspace's node_modules, so that build could
   not finish. Uvicorn is never started, port 9119 is never bound, and the
   Customer AI proxy's upstream connect gets ECONNREFUSED -> 502.
+  (With issue 2 now understood, the precise statement is: the runtime build could
+  not complete because devDependencies were absent by the same NODE_ENV rule, and
+  the .web_ui_build.lock made that failure silent rather than loud.)
 
 FIX (Dockerfile only, 2 added statements):
-  RUN npm ci --workspace ui-tui --workspace web --include-workspace-root \
+  RUN npm ci --workspace ui-tui --workspace web --include-workspace-root --include=dev \
    && npm run build -w web
   ENV HERMES_WEB_DIST=/opt/hermes-agent/hermes_cli/web_dist
 With HERMES_WEB_DIST set, main_dashboard.py:853 takes the "caller-managed dist"
@@ -89,11 +141,13 @@ symptom amplifier, not the root cause: with a prebuilt dist the branch is never
 reached at all.
 
 Layer 2 — the build itself cannot succeed in this image. Even holding the lock,
-`_do_build_web_ui` must run `npm install` for the `web` workspace and then
-`npm run build`. The image has no web workspace node_modules, so npm must reach
-the registry at runtime — unavailable/slow in the container, and unbounded, so it
-hangs rather than failing. Note npm's output is only relayed on FAILURE
-(_relay_npm_output is called from _report_web_build_failure), so a hanging build
+`_do_build_web_ui` must install the `web` workspace and then run `npm run build`
+(`tsc -b && vite build`). The image has no web workspace node_modules, so that
+install must reach the registry at runtime — unavailable/slow in the container,
+and unbounded, so it hangs rather than failing. And per issue 2 above, even when
+it does run under NODE_ENV=production it installs an incomplete tree and then
+fails loudly at tsc instead. Note npm's output is only relayed on FAILURE
+(_relay_npm_output is called from _report_web_build_failure), so a hanging install
 is silent by construction.
 
 ------------------------------------------------------------------------------
@@ -149,7 +203,7 @@ Dockerfile, inserted after the WhatsApp bridge npm ci (:139), before the
 `hermes` launcher RUN. Runs as `customerai` (USER at :127) into /opt/hermes-agent
 (chowned to customerai at :108), so no new root-owned tree is introduced.
 
-    RUN npm ci --workspace ui-tui --workspace web --include-workspace-root \
+    RUN npm ci --workspace ui-tui --workspace web --include-workspace-root --include=dev \
      && npm run build -w web
     ENV HERMES_WEB_DIST=/opt/hermes-agent/hermes_cli/web_dist
 
@@ -161,6 +215,10 @@ narrower install would silently prune deps the build needs (see the #43564/#6435
 note in the source). The build's vite outDir is already ../hermes_cli/web_dist,
 so the output lands exactly where HERMES_WEB_DIST points.
 
+Why --include=dev: see issue 2. It is what Hermes itself forces
+(main_web_build.py:335). The one-token change is the entire fix for the Blitz
+build failure; the ENV line is unchanged from the previous pass.
+
 Deliberately NOT changed: the proxy (server/src/middleware/hermesDashboardProxy.js),
 server.js, supervisor.mjs, the pairing architecture, auth, the /api/whatsapp/*
 routes, the frontend, MongoDB, and the dashboard command line itself.
@@ -168,20 +226,57 @@ routes, the frontend, MongoDB, and the dashboard command line itself.
 ------------------------------------------------------------------------------
 6. VERIFICATION OF THE FIX (all executed against the pinned agent)
 ------------------------------------------------------------------------------
+ISSUE 2 (the Blitz build failure) — REPRODUCED, THEN FIXED AND RE-VERIFIED:
+REPRO  Built an isolated tree from the pinned repo (all workspace manifests +
+    package-lock.json + web/ and apps/shared/ sources) so the real install was
+    never disturbed, then ran the exact Blitz command with NODE_ENV=production:
+        NODE_ENV=production npm ci --workspace ui-tui --workspace web \
+          --include-workspace-root
+        -> "added 356 packages, and audited 361 packages"   <- matches Blitz exactly
+        -> vitest, @rolldown/plugin-babel, @vitejs/plugin-react ABSENT from node_modules
+        -> npm run build -w web = 91 tsc errors, exit 1
+    Error histogram and the three "Cannot find module" errors are exactly those
+    reported: TS2307 x62, TS7006 x21, TS2591, TS2304, TS7031, TS7016, TS7053,
+    TS2347, TS18046; missing modules @rolldown/plugin-babel, @vitejs/plugin-react,
+    vitest; plus TS2591 "Cannot find name 'node:fs'. ... Try `npm i --save-dev
+    @types/node`", TS2304 "Cannot find name '__dirname'", and TS7016 "Could not
+    find a declaration file for module 'qrcode'".
+    => The reproduction matches the reported failure line for line, including the
+       356-package count. This confirms the diagnosis rather than assuming it.
+PASS  Same tree, same env, plus the one flag:
+        NODE_ENV=production npm ci --workspace ui-tui --workspace web \
+          --include-workspace-root --include=dev
+        -> "added 551 packages, and audited 556 packages"
+        -> npm run build -w web = "✓ built in 52.84s", exit 0
+      Note NODE_ENV=production was still set for the build, so this isolates
+      --include=dev as the sole cause.
+PASS  Re-verified in the REAL pinned checkout, running the exact Dockerfile
+      command with NODE_ENV=production set:
+        -> "added 551 packages, and audited 556 packages in 1m", CI exit 0
+        -> npm run build -w web = "✓ built in 52.55s", BUILD_EXIT=0
+      (This reinstalled the local agent tree with dev deps; the earlier local
+      success had been with no NODE_ENV set at all, which is precisely why the
+      bug was invisible here and fatal on Blitz.)
+CONFIRMED  npm ci dry-run under NODE_ENV=production without the flag reports
+      "removed 195 packages" — the dev half of the tree being pruned.
+
+ISSUE 1 (the 502) — PREVIOUSLY VERIFIED, RE-CONFIRMED after the change:
 PASS  Ran the exact build steps from the new Dockerfile step on the pinned agent:
-        npm ci --workspace ui-tui --workspace web --include-workspace-root
-          -> NPMCI_EXIT=0
-        npm run build -w web
-          -> "✓ built in 45.58s", BUILD_EXIT=0
-      Produced hermes_cli/web_dist/ containing index.html, assets/, favicon.ico,
-      fonts/, fonts-terminal/ — i.e. every path the dashboard's prefix rewriter
-      handles (web_server_dashboard.py:163-190).
-PASS  THE DASHBOARD NOW BINDS. With HERMES_WEB_DIST set:
+        -> hermes_cli/web_dist/ containing index.html, assets/, favicon.ico,
+           fonts/, fonts-terminal/ — i.e. every path the dashboard's prefix
+           rewriter handles (web_server_dashboard.py:163-190).
+PASS  THE DASHBOARD STILL BINDS with the freshly built dist (deleted web_dist,
+    rebuilt from scratch, then booted):
         "→ Using web dist from HERMES_WEB_DIST: .../hermes_cli/web_dist"
         "HERMES_DASHBOARD_READY port=9119"
+        "Hermes Web UI → http://127.0.0.1:9119"
       and `ss -ltn` confirmed a listener on 9119. No npm, no build, no hang.
-PASS  AUTH IS STILL ENFORCED (not weakened to achieve the fix):
+PASS  AUTH IS STILL ENFORCED (not weakened to achieve the fix). Verified earlier
+      on the 0.0.0.0 bind that production actually uses:
         unauthenticated GET /  ->  302 Location: /login?next=%2F
+      (A later check on a 127.0.0.1 bind returns 200 without auth — that is
+      Hermes' documented local-bind exemption, not a change; the container binds
+      0.0.0.0, so the auth path is the one that applies.)
 PASS  LOGIN WORKS with the configured basic-auth credentials:
         POST /auth/password-login {"provider":"basic","username":...,"password":...}
         -> 200 {"ok":true,"next":"/"}
@@ -203,11 +298,14 @@ NOTE  Replaying the session cookie by hand was needed only because curl will not
 7. TRADE-OFFS / THINGS TO EXPECT
 ------------------------------------------------------------------------------
 - IMAGE SIZE AND BUILD TIME INCREASE. This is the unavoidable cost of a working
-  dashboard UI: the `web` workspace node_modules plus the built dist. Measured
-  locally, npm ci ~90s and vite build ~105s, so expect the Docker build to grow
-  by a few minutes. I did not prune dev dependencies afterwards: it would shrink
-  the image but risks removing something the dashboard needs, and minimality was
-  the priority. Easy to revisit.
+  dashboard UI: the `web` workspace node_modules (551 packages) plus the built
+  dist. Measured locally, npm ci ~60s and vite build ~53s, so expect the Docker
+  build to grow by a couple of minutes. I did not prune dev dependencies
+  afterwards: it would shrink the image but risks removing something the
+  dashboard needs, and minimality was the priority. Easy to revisit.
+  The dev deps are build-time only and are not needed at runtime now that the
+  dist is baked in, so a later `npm prune --omit=dev` after the build is the
+  natural follow-up if image size becomes a problem.
 - The dashboard needs ~24-30s to become ready after the container starts. The
   proxy will return 502 during that window; this is expected, not a regression.
 - HERMES_DASHBOARD still must be enabled for the supervisor to start the process,
@@ -232,7 +330,11 @@ NOTE  Replaying the session cookie by hand was needed only because curl will not
 - WHATSAPP_AUTH_DIR is still documented but never read by Hermes; real
   credentials live at
   /app/data/hermes/platforms/whatsapp/session/creds.json.
-- Not verified on the real Blitz image: this fix was validated on the pinned
-  agent at commit 4716ec0 on this machine, not inside the built container. The
-  Dockerfile step is the same command that was run successfully here.
+- Not verified on the real Blitz image: the fix was validated by running the
+  exact Dockerfile command against the pinned agent at commit 4716ec0 on this
+  machine, including a byte-for-byte reproduction of the failing install
+  (356 packages, 91 tsc errors). The Dockerfile layer itself has still not been
+  executed, because there is no Docker daemon in this environment. A rebuild is
+  required for either fix to take effect; the currently deployed image has
+  neither.
 ===============================================================================
