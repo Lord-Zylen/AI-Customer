@@ -138,6 +138,23 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
 # in place and never needs a runtime npm install.
 RUN npm ci --prefix /opt/hermes-agent/scripts/whatsapp-bridge
 
+# Hermes dashboard frontend, prebuilt at image build time.
+# `hermes dashboard` builds the web UI BEFORE it binds (main_dashboard.py:821 calls
+# _build_web_ui(), fatal=True), and that build is a blocking `npm install` + `vite build`
+# of the `web` workspace. This image ships neither hermes_cli/web_dist nor the web
+# workspace's node_modules, so at runtime that build could not complete: the dashboard
+# blocked indefinitely — silently, because it first waits on .web_ui_build.lock, which
+# the already-running gateway holds (main_web_build.py:412-416) — and never bound 9119.
+# The Customer AI proxy then saw ECONNREFUSED/502.
+# Building here and exporting HERMES_WEB_DIST makes the runtime build a no-op
+# (web_server.py:58 reads the override; main_dashboard.py:853 skips the build).
+# The workspace closure mirrors hermes_cli/main_web_build.py::_web_npm_install_context
+# (ui-tui + web + --include-workspace-root); the build's vite outDir is already
+# ../hermes_cli/web_dist. Runs as customerai (USER above) into the chowned agent dir.
+RUN npm ci --workspace ui-tui --workspace web --include-workspace-root \
+ && npm run build -w web
+ENV HERMES_WEB_DIST=/opt/hermes-agent/hermes_cli/web_dist
+
 # `hermes` CLI launcher (mirrors the verified ~/.local/bin/hermes).
 RUN printf '#!/usr/bin/env bash\nunset PYTHONPATH PYTHONHOME\nexec /opt/hermes-agent/venv/bin/python /opt/hermes-agent/hermes "$@"\n' \
       > /home/customerai/.local/bin/hermes \
