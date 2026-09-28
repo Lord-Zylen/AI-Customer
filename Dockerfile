@@ -57,6 +57,9 @@ ENV PORT=8080
 ENV HERMES_HOME=/app/data/hermes
 ENV HERMES_BIN=/home/customerai/.local/bin/hermes
 ENV HERMES_GATEWAY_STATE=/app/data/hermes/gateway_state.json
+# Optional Hermes dashboard (WhatsApp pairing/QR for headless platforms).
+# Started by the supervisor only when HERMES_DASHBOARD is true/1/yes.
+ENV HERMES_DASHBOARD_PORT=9119
 ENV WHATSAPP_AUTH_DIR=/app/data/whatsapp-auth
 # CAI_HOOK_BASE_URL is NOT hardcoded here: the entrypoint derives it from $PORT
 # if the operator did not set it explicitly (Render's PORT is dynamic).
@@ -140,7 +143,8 @@ RUN printf '#!/usr/bin/env bash\nunset PYTHONPATH PYTHONHOME\nexec /opt/hermes-a
       > /home/customerai/.local/bin/hermes \
     && chmod +x /home/customerai/.local/bin/hermes
 
-EXPOSE 8080
+# 8080 is the Customer AI backend; 9119 is the optional Hermes dashboard.
+EXPOSE 8080 9119
 
 # Persistence is provided by a Render Persistent Disk mounted at /app/data
 # (see render.yaml). No Docker VOLUME: a VOLUME instruction would make
