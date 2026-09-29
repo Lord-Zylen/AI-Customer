@@ -1,0 +1,369 @@
+================================================================================
+HERMES-ONLY BLITZ DEPLOYMENT — REPORT
+================================================================================
+Status   : COMPLETE (implementation + local verification)
+Date     : 2026-09-29
+Repo     : ~/Desktop/AI Customer  (git: Lord-Zylen/AI-Customer, branch main)
+Scope    : a SEPARATE Hermes-only container for Blitz, so Hermes + the
+           WhatsApp pairing flow can be tested independently of Customer AI.
+Change   : ADDITIVE ONLY. The combined Customer AI + Hermes production
+           deployment is untouched and still deploys exactly as before.
+
+--------------------------------------------------------------------------------
+1. WHAT WAS ADDED
+--------------------------------------------------------------------------------
+All new files live in one new directory, deploy/blitz/hermes/ :
+
+  Dockerfile (11549 B)  Hermes-only image, 3 stages, no Customer AI
+  entrypoint.sh          PID-1 prep: /app/data, config seed, exec supervisor
+  supervisor.mjs         PID 1: supervises dashboard (critical) + gateway
+  config.yaml            Hermes-only config seed (plugins.enabled: [])
+  .env.example           complete env list, names only, no secret values
+  use-as-blitz-root.sh   reversible root-Dockerfile swap (keeps a backup)
+  restore-production-dockerfile.sh   undoes that swap
+  README.md (16757 B)    full operator documentation
+
+One tracked file was modified:
+
+  .dockerignore   +5 lines
+    - allows deploy/blitz/hermes/.env.example through the `.env.*` rule
+    - excludes deploy/blitz/hermes/Dockerfile.production.bak from build contexts
+
+NOT modified (verified with `git diff --quiet`, all clean):
+  Dockerfile, deploy/blitz/entrypoint.sh, deploy/blitz/supervisor.mjs,
+  hermes/configuration/config.yaml, docker-compose.yml, server/, client/,
+  deploy/systemd/hermes-gateway.service, .env
+
+Git status is exactly:
+  M .dockerignore
+  ?? deploy/blitz/hermes/
+
+--------------------------------------------------------------------------------
+2. ARCHITECTURE
+--------------------------------------------------------------------------------
+Blitz router --HTTPS--> 0.0.0.0:9119  Hermes dashboard   (ONLY public port)
+                              \--> WhatsApp pairing / QR flow
+                     Hermes gateway                     (internal)
+                       \--> WhatsApp Baileys bridge      (internal, loopback)
+
+  * entrypoint.sh prepares /app/data, seeds the config on first boot, then
+    `exec node supervisor.mjs` so Node IS pid 1 and receives SIGTERM directly.
+  * supervisor.mjs starts the dashboard and the gateway. The dashboard is
+    critical (if it dies the container exits non-zero so the platform restarts
+    it). The gateway is never fatal — see section 7.
+  * Node is present for three real reasons: the WhatsApp Baileys bridge,
+    Hermes' own dashboard SPA build, and the supervisor. It does NOT serve
+    Customer AI.
+  * HERMES_HOME = /app/data/hermes  -> the whole persistent store, including
+    platforms/whatsapp/session/creds.json.
+
+The image installs: Hermes (pinned commit), its Python deps, the WhatsApp
+bridge's npm deps, the prebuilt dashboard SPA.
+The image does NOT install: MongoDB, Redis, Express, Mongoose, the Customer AI
+Node server, the Customer AI Vite client. No Customer AI env var is referenced
+anywhere except in explanatory comments.
+
+Image build (3 stages, one pinned clone reused by all):
+  1. hermes-src       git clone + checkout of the pinned commit; asserts the
+                      files the build depends on actually exist at that commit.
+  2. dashboard-build  npm ci (web + ui-tui + root, --include=dev), then
+                      `npm run build -w web`. hermes dashboard builds this SPA
+                      *before it binds* and the build is fatal, so it is
+                      prebuilt here and exported via HERMES_WEB_DIST.
+  3. final            uv venv + `uv sync --extra all --locked` (Python 3.11),
+                      npm ci for the bridge, the prebuilt SPA, the runtime
+                      files, non-root user, EXPOSE 9119, HEALTHCHECK.
+
+Runtime user: hermesai, uid/gid 1000 (renamed from the base image's `node`
+user; the build fails loudly if uid/gid 1000 is ever unavailable). Hermes is
+installed at exactly the production paths: /opt/hermes-agent and
+/opt/hermes-agent/venv, and installed the same way (`uv sync --extra all
+--locked`, `npm ci --prefix <bridge>`).
+
+--------------------------------------------------------------------------------
+3. WHY THE CONFIG TEMPLATE DIFFERS FROM hermes/configuration/config.yaml
+--------------------------------------------------------------------------------
+The only behavioural difference is `plugins.enabled: []`.
+
+The combined config enables `customer-ai-gate`, which POSTs every inbound
+WhatsApp message to the Customer AI decision webhook. That backend does not run
+in this image, and the plugin is default-deny when CAI_HOOK_SECRET is absent —
+so leaving it enabled would silently swallow every inbound message.
+
+hermes/configuration/config.yaml is NOT modified. The Hermes-only template is a
+separate file, and the seeded config was verified byte-identical to the
+template after a first boot.
+
+--------------------------------------------------------------------------------
+4. BLITZ CONFIGURATION
+--------------------------------------------------------------------------------
+Use a SEPARATE Blitz project for the test; do not repoint production.
+
+Make the Hermes Dockerfile the root one, because Blitz auto-detects the
+repository-root Dockerfile:
+
+  Option A (recommended) — a separate branch keeps production untouched:
+    git checkout -b hermes-only-blitz
+    ./deploy/blitz/hermes/use-as-blitz-root.sh
+    git add -A && git commit -m "chore: Hermes-only root Dockerfile (Blitz test)"
+    git push -u origin hermes-only-blitz
+    # then create the Blitz project from THIS branch
+
+  Option B — swap locally, test, swap back:
+    ./deploy/blitz/hermes/use-as-blitz-root.sh
+    # ... test on Blitz ...
+    ./deploy/blitz/hermes/restore-production-dockerfile.sh
+
+  If the platform accepts a custom Dockerfile path, use
+  ./deploy/blitz/hermes/Dockerfile and skip the swap. The build context must be
+  the repository root either way.
+
+Platform settings:
+  Build method        : Dockerfile
+  Port                : 9119
+  Health check        : /api/health   (optional; the image ships a HEALTHCHECK)
+  Persistent volume   : mount at /app/data
+  Environment         : section 5
+
+--------------------------------------------------------------------------------
+5. ENVIRONMENT VARIABLES
+--------------------------------------------------------------------------------
+REQUIRED
+  HERMES_DASHBOARD_BASIC_AUTH_USERNAME   dashboard login name
+  HERMES_DASHBOARD_BASIC_AUTH_PASSWORD   dashboard password
+      A 0.0.0.0 dashboard CANNOT run without an auth provider. Hermes refuses
+      to start and --insecure does NOT bypass this (June 2026 hardening).
+      There is no unauthenticated public-dashboard option. A username without a
+      password is rejected by the entrypoint before Hermes is even started.
+      (HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH is the alternative.)
+  GROQ_API_KEY                           the AI provider, matched by
+      providers.groq.key_env. Without it the container is healthy and pairing
+      works, but every reply fails with 401.
+
+RECOMMENDED
+  HERMES_DASHBOARD_BASIC_AUTH_SECRET      stable 32+ byte random string.
+      Without it Hermes generates a random per-process signing key and every
+      restart logs you out.
+  WHATSAPP_ENABLED=true                  the image default; kept ON so the
+      unpaired preflight is exercised honestly rather than masked.
+
+OPTIONAL — image defaults are already correct
+  HERMES_DASHBOARD_HOST=0.0.0.0, HERMES_DASHBOARD_PORT=9119,
+  HERMES_DASHBOARD_ENABLED=true, HERMES_HOME=/app/data/hermes,
+  GATEWAY_ENABLED=true, GATEWAY_PARK_RETRY_MS=30000,
+  GATEWAY_BACKOFF_BASE_MS=15000, GATEWAY_BACKOFF_MAX_MS=300000,
+  GATEWAY_GRACE_MS=70000, WHATSAPP_HOME_CHANNEL
+
+EXPLICITLY NOT NEEDED BY THIS IMAGE
+  MONGODB_URI, REDIS_URL, SESSION_SECRET, AI_API_KEY, CAI_HOOK_SECRET,
+  CAI_HOOK_BASE_URL, CLIENT_ORIGIN, VITE_API_URL, TRUST_PROXY, HOST, PORT,
+  ADMIN_*, HERMES_GATEWAY_STATE (that last one is a Customer AI backend
+  variable — read by server/src/services/whatsapp.service.js, never by Hermes;
+  it was deliberately removed from this image after inspection).
+
+SECRET HANDLING
+  * No secret is baked into the image; no ARG/ENV default holds a secret value.
+  * .env is in .dockerignore and .gitignore; the committed .env.example has
+    every assignment empty.
+  * Neither entrypoint.sh nor supervisor.mjs prints a value — only variable
+    names and non-secret settings.
+  * Audited mechanically: no value of any secret-bearing variable from the
+    repo's own .env (GROQ_API_KEY, MONGODB_URI, REDIS_URL, SESSION_SECRET,
+    CAI_HOOK_SECRET, AI_API_KEY, ADMIN_*) appears anywhere under
+    deploy/blitz/hermes/.
+  * The dashboard is a full Hermes control panel (config, keys, sessions, files)
+    — rotate the password if it is ever exposed.
+
+--------------------------------------------------------------------------------
+6. PERSISTENT STORAGE
+--------------------------------------------------------------------------------
+Attach a persistent volume at /app/data. Nothing else needs persisting.
+
+  /app/data/hermes/                        <- HERMES_HOME
+  |-- config.yaml                          seeded on first boot; yours to edit
+  |-- platforms/whatsapp/session/creds.json  WhatsApp credentials  ** BACK UP **
+  |-- platforms/whatsapp/session/app_state.json
+  |-- state.db  shared-state.db            SQLite state
+  `-- sessions/  logs/  cache/  cron/  memories/  ...
+
+  * The first deployment must start with NO creds.json so you can pair from the
+    dashboard. The image ships an empty Hermes home; the local ~/.hermes is
+    never copied in (no COPY, no VOLUME).
+  * If the platform supports a second mount, /app/data/whatsapp-auth is created
+    for parity with the combined deployment, but Hermes does not require it —
+    the session path is driven purely by HERMES_HOME.
+  * No Docker VOLUME instruction is used on purpose: an anonymous volume would
+    shadow the mounted disk.
+  * Losing /app/data means re-pairing WhatsApp.
+
+--------------------------------------------------------------------------------
+7. HEALTH, AND THE UNPAIRED CASE
+--------------------------------------------------------------------------------
+HEALTHCHECK polls Hermes' own auth-exempt endpoint:
+  GET http://127.0.0.1:$HERMES_DASHBOARD_PORT/api/health
+  -> 200 {"ok":true,"version":"0.21.3","auth_required":true}
+
+HEALTHY MEANS "HERMES IS RUNNING". IT DOES NOT MEAN "WHATSAPP IS PAIRED".
+No fake probe, no probe that reports pairing.
+
+Before pairing, WhatsApp stays ENABLED. The gateway's WhatsApp preflight finds
+no creds.json and Hermes exits with code 78
+(GATEWAY_FATAL_CONFIG_EXIT_CODE):
+
+  [Whatsapp] WhatsApp is enabled but not paired (no creds.json at
+    /app/data/hermes/platforms/whatsapp/session/creds.json). Pair from the
+    dashboard or run `hermes whatsapp`; remove WHATSAPP_ENABLED from your .env
+    to disable.
+  Gateway hit a non-retryable startup conflict: whatsapp: WhatsApp enabled but
+    not paired — pair from the dashboard or run `hermes whatsapp`.
+  supervisor gateway parked (exit 78: fatal config, normally "WhatsApp enabled
+    but not paired"). Retrying in 30s — pair WhatsApp from the dashboard
+    (Channels) in the meantime.
+
+The supervisor PARKS the gateway and retries every GATEWAY_PARK_RETRY_MS. The
+container stays up and the dashboard stays reachable. WhatsApp is NOT disabled
+to make the container look healthy.
+
+Gateway exit-code contract implemented by supervisor.mjs:
+  78   fatal config (normally unpaired)  -> park, retry in 30s
+  75   service restart requested          -> restart immediately
+  0    clean stop (e.g. scale-to-zero)    -> restart shortly
+  other / signal  crash                   -> backoff 15s, cap 300s
+  SIGUSR1  drain                          -> graceful stop (non-fatigued mode)
+Uptime >= 300s counts as healthy and resets the backoff.
+
+--------------------------------------------------------------------------------
+8. HOW TO PAIR WHATSAPP (exact steps)
+--------------------------------------------------------------------------------
+`hermes whatsapp` calls _require_tty("whatsapp"), so the CLI wizard CANNOT run
+in a headless container. The dashboard is the supported headless path.
+
+  1. Deploy. Container comes up healthy; the gateway is parked, waiting.
+  2. Open https://<your-blitz-domain>/  ->  "/" 302-redirects to /login.
+  3. Log in with HERMES_DASHBOARD_BASIC_AUTH_USERNAME / _PASSWORD.
+  4. Go to Channels (URL path /channels).
+  5. Start the WhatsApp setup / onboarding flow.
+  6. Scan the QR (or open the https://wa.me/settings/linked_devices#... link)
+     with the phone: WhatsApp -> Settings -> Linked devices -> Link a device.
+  7. The card turns to Connected. creds.json is written to
+     /app/data/hermes/platforms/whatsapp/session/.
+  8. Within ~30s the supervisor's next attempt passes the preflight and the
+     gateway connects. (The dashboard also asks Hermes to restart the gateway
+     itself; either path lands in the same place.)
+
+Equivalent API calls, verified live:
+  # log in, keep the cookie
+  curl -s -c cj.txt -X POST "$DASH/auth/password-login" \
+    -H 'Content-Type: application/json' \
+    -d '{"provider":"basic","username":"<user>","password":"<password>"}'
+  # start pairing
+  curl -s -b cj.txt -X POST "$DASH/api/messaging/whatsapp/onboarding/start" \
+    -H 'Content-Type: application/json' -d '{"mode":"self-chat"}'
+  #   -> {"pairing_id":"...","status":"installing", ...}
+  # poll for the QR / connection
+  curl -s -b cj.txt "$DASH/api/messaging/whatsapp/onboarding/<pairing_id>"
+  # give up / clean up
+  curl -s -b cj.txt -X DELETE "$DASH/api/messaging/whatsapp/onboarding/<id>"
+
+Note: the login body REQUIRES "provider":"basic" alongside the credentials.
+A body of just {"username","password"} returns 422.
+
+--------------------------------------------------------------------------------
+9. TESTS RUN AND RESULTS
+--------------------------------------------------------------------------------
+Static / structural
+  PASS  bash -n  on entrypoint.sh, use-as-blitz-root.sh,
+                 restore-production-dockerfile.sh
+  PASS  node --check on supervisor.mjs
+  PASS  every build-context COPY source in the Dockerfile exists at the repo root
+  PASS  every referenced stage (hermes-src, dashboard-build) is declared
+  PASS  the pinned commit 4716ec0ba4e212105f8f162c226f052b25f8a76b exists and
+        contains every file the Dockerfile asserts: hermes_cli/main.py,
+        hermes_cli/main_dashboard.py, scripts/whatsapp-bridge/bridge.js,
+        scripts/whatsapp-bridge/package-lock.json, pyproject.toml, uv.lock,
+        package.json, package-lock.json, .npmrc, web/package.json,
+        ui-tui/package.json, apps/shared/package.json
+  PASS  npm workspace names in the Dockerfile match the real root package.json
+        ('apps/*', 'ui-tui', 'ui-tui/packages/*', 'web', 'tests-js')
+  PASS  the vite outDir the Dockerfile asserts (hermes_cli/web_dist) matches
+        web/vite.config.ts (outDir: "../hermes_cli/web_dist")
+  PASS  secrets audit: no secret value, no high-entropy literal
+
+Root-Dockerfile safety
+  PASS  swap -> backup created, root Dockerfile replaced
+  PASS  restore -> root Dockerfile byte-identical to the committed version
+  PASS  git status shows the root Dockerfile NOT modified after restore
+  PASS  re-running the swap with an existing backup is a safe no-op
+        (this was an early bug: it silently clobbered the backup; fixed)
+
+Live end-to-end run (real Hermes 0.21.3 at the pinned commit, isolated
+temporary HERMES_HOME under /tmp, dashboard on 0.0.0.0:19200)
+  PASS  entrypoint prepared the persistent dir, seeded config on first boot
+  PASS  "No WhatsApp session yet - pair it from the dashboard under Channels."
+  PASS  dashboard bound 0.0.0.0 and logged HERMES_DASHBOARD_READY
+  PASS  GET /api/health -> HTTP 200
+        {"ok":true,"version":"0.21.3","auth_required":true}
+  PASS  GET / -> HTTP 302 -> /login?next=%2F  (not publicly wide open)
+  PASS  password login succeeded (after including "provider":"basic")
+  PASS  the WhatsApp onboarding API returned a real linking payload beginning
+        https://wa.me/settings/linked_devices#2@...  then went to
+        status "waiting"; the pairing was cancelled with DELETE and no
+        creds.json was created
+  PASS  the gateway exited 78 while unpaired; the supervisor parked and
+        retried; the container stayed up and healthy
+  PASS  when a creds.json is present the entrypoint logs
+        "WhatsApp session found - the gateway should connect on start"
+        (verified with a deliberately fake creds.json, then removed; the real
+        user's session was never touched)
+  PASS  NO Customer AI backend: no listener on 8080 / 5000 / 3000, no mongod,
+        no redis-server, no server/src/server.js process
+  PASS  the seeded config parses and has plugins.enabled == []
+        and providers.groq.key_env == GROQ_API_KEY
+  PASS  the seeded config is byte-identical to the shipped template
+  PASS  second boot did NOT overwrite an operator-edited config (md5 unchanged)
+  PASS  graceful shutdown: SIGTERM -> supervisor SIGTERMs the dashboard,
+        "shutdown complete", no leftover hermes processes, port released
+  PASS  fail-fast, no auth env at all            -> exit 1
+  PASS  fail-fast, username without a password   -> exit 1
+  PASS  fail-fast, unwritable /app/data          -> exit 1
+  PASS  no test data leaked into the user's real ~/.hermes (all runs used
+        temporary dirs, since deleted)
+
+--------------------------------------------------------------------------------
+10. NOT VERIFIED (and why)
+--------------------------------------------------------------------------------
+Docker is NOT available on this machine:
+  * `docker version` -> "permission denied while trying to connect to the
+    docker API at unix:///var/run/docker.sock"
+  * /var/run/docker.sock is root:root mode 660; no docker group for this user
+  * `sudo -n` requires interactive authentication
+
+Therefore the following remain UNVERIFIED — they are the first things to check
+when you run it on Blitz:
+  * that the image builds at all (the git clone, `npm ci --workspace ...`,
+    `vite build`, `uv sync --extra all --locked`, and the bridge `npm ci`
+    inside the build)
+  * the resulting image size
+  * the in-image uid/gid 1000 setup and file ownership
+  * the HEALTHCHECK passing inside a real container
+  * the real Blitz deploy itself
+  * Blitz's own persistent-volume UI and Dockerfile-selection behaviour, which
+    cannot be confirmed from the repository
+
+Also NOT done, deliberately:
+  * scanning the QR to actually link the user's real WhatsApp account. The
+    pairing flow was exercised up to a genuine, scannable pairing code, but no
+    real account was linked, so the post-pair gateway connect is unverified.
+
+Recommended first actions on Blitz:
+  1. Create the separate project from the hermes-only branch.
+  2. Mount the persistent volume at /app/data.
+  3. Set the three auth env vars + GROQ_API_KEY.
+  4. Deploy, confirm /api/health returns 200, then pair from Channels.
+  5. Back up /app/data/hermes/platforms/whatsapp/session/ afterwards.
+  6. To go back to production: use the production branch, or run
+     ./deploy/blitz/hermes/restore-production-dockerfile.sh.
+
+NOTE: this report is a living document — it is updated whenever the
+deployment changes or new test results become available.
+================================================================================

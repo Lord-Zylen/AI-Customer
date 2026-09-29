@@ -14,8 +14,13 @@ hermes-agent/node_modules
 .env.*
 !.env.example
 !client/.env.example
+!deploy/blitz/hermes/.env.example
 **/.env
 **/.env.local
+
+# The Hermes-only deployment's local-only helper: the backup the
+# use-as-blitz-root.sh swap keeps. Never part of any image build context.
+deploy/blitz/hermes/Dockerfile.production.bak
 
 # Build output (the Dockerfile rebuilds the client itself)
 dist
