@@ -14,6 +14,7 @@ const fields = [
   ['deliveryInformation', 'Delivery information'],
   ['paymentInformation', 'Payment information'],
   ['commonQuestions', 'Common questions and answers'],
+  ['responseStyle', 'Reply style (how the agent should answer)'],
 ];
 
 const tabs = [

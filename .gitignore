@@ -6,3 +6,10 @@ node_modules
 dist
 data/whatsapp-auth
 customer-ai-debug-report.txt
+report.txt
+__pycache__/
+*.pyc
+*.bak_*
+
+# Local backup files
+*.bak

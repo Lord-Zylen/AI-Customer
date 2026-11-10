@@ -16,12 +16,15 @@ router.get('/', async (req, res, next) => {
       : req.query.filter === 'active' ? { aiEnabled: true, status: { $ne: 'RESOLVED' } }
       : req.query.filter === 'resolved' ? { status: 'RESOLVED' } : {};
     const conversations = await Conversation.find(filter)
-      .populate('customerId', 'name phone')
+      .populate('customerId', 'name phone email notes')
       .populate('assignedTo', 'name')
       .sort({ lastMessageAt: -1 })
       .limit(100);
-    const lastMessages = await Message.find({ conversationId: { $in: conversations.map(c => c._id) } }).sort({ createdAt: -1 });
-    const latest = Object.fromEntries(lastMessages.map(m => [String(m.conversationId), m]));
+    // Ascending order means the final write for each conversation is its newest
+    // message. Previously the descending query let the oldest message win.
+    const lastMessages = await Message.find({ conversationId: { $in: conversations.map(c => c._id) } }).sort({ createdAt: 1 });
+    const latest = {};
+    for (const message of lastMessages) latest[String(message.conversationId)] = message;
     res.json(conversations.map(c => ({ ...c.toObject(), lastMessage: latest[String(c._id)] || null })));
   } catch (e) { next(e); }
 });
@@ -34,16 +37,64 @@ router.get('/:id', async (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+export function normalizeConversationPatch(raw = {}) {
+  const allowed = ['aiEnabled', 'status', 'requiresHuman', 'assignedTo'];
+  const patch = Object.fromEntries(Object.entries(raw).filter(([k]) => allowed.includes(k)));
+  if (patch.status) patch.status = String(patch.status).toUpperCase();
+
+  if (patch.aiEnabled === true) {
+    patch.requiresHuman = false;
+    patch.status = 'OPEN';
+    patch.handoffReason = '';
+    patch.handoffAt = null;
+    patch.handoffAcknowledgedAt = null;
+    patch.handoffResolvedAt = new Date();
+  } else if (patch.aiEnabled === false) {
+    patch.requiresHuman = true;
+    patch.status = 'HUMAN_REQUIRED';
+    patch.handoffReason = 'MANUAL';
+    patch.handoffAt = new Date();
+    patch.handoffAcknowledgedAt = null;
+  }
+
+  if (patch.status === 'RESOLVED') {
+    patch.requiresHuman = false;
+    patch.handoffReason = '';
+    patch.handoffAcknowledgedAt = null;
+    patch.handoffResolvedAt = new Date();
+  } else if (patch.status === 'HUMAN_REQUIRED') {
+    patch.requiresHuman = true;
+    patch.handoffReason = patch.handoffReason || 'MANUAL';
+    patch.handoffAt = patch.handoffAt || new Date();
+  } else if (patch.status === 'OPEN') {
+    // Opening a conversation and leaving requiresHuman stale would immediately
+    // re-handoff the next inbound. Treat OPEN as a real AI re-enable unless the
+    // caller explicitly asks to keep human handling.
+    if (patch.requiresHuman === undefined) patch.requiresHuman = false;
+    if (patch.requiresHuman === false) {
+      patch.handoffReason = '';
+      patch.handoffAcknowledgedAt = null;
+      patch.handoffResolvedAt = new Date();
+    }
+  }
+
+  if (patch.requiresHuman === true && patch.status !== 'RESOLVED') {
+    patch.status = 'HUMAN_REQUIRED';
+    patch.handoffReason = patch.handoffReason || 'MANUAL';
+    patch.handoffAt = patch.handoffAt || new Date();
+  }
+  return patch;
+}
+
 router.patch('/:id', async (req, res, next) => {
   try {
-    const allowed = ['aiEnabled', 'status', 'requiresHuman', 'assignedTo'];
-    const patch = Object.fromEntries(Object.entries(req.body).filter(([k]) => allowed.includes(k)));
-    if (patch.aiEnabled === true) { patch.requiresHuman = false; if (!patch.status) patch.status = 'OPEN'; }
-    if (patch.aiEnabled === false) { patch.requiresHuman = true; patch.status = 'HUMAN_REQUIRED'; }
-    const item = await Conversation.findByIdAndUpdate(req.params.id, patch, { new: true, runValidators: true }).populate('customerId', 'name phone');
+    const patch = normalizeConversationPatch(req.body);
+    const item = await Conversation.findByIdAndUpdate(req.params.id, patch, { new: true, runValidators: true })
+      .populate('customerId', 'name phone email notes')
+      .populate('assignedTo', 'name');
     if (!item) return res.status(404).json({ error: { message: 'Conversation not found.' } });
     if (item.requiresHuman && item.status !== 'RESOLVED') {
-      await addHuman(item.id, { chatId: item.customerId?.phone || '', reason: 'MANUAL', updatedAt: new Date().toISOString() });
+      await addHuman(item.id, { chatId: item.customerId?.phone || '', reason: item.handoffReason || 'MANUAL', updatedAt: new Date().toISOString() });
     } else {
       await removeHuman(item.id);
     }
@@ -64,8 +115,11 @@ router.post('/:id/assign', async (req, res, next) => {
       item.assignedTo = req.user.id;
       await item.save();
     }
-    const updated = await Conversation.findById(req.params.id).populate('customerId', 'name phone').populate('assignedTo', 'name');
-    res.json(updated);
+    const updated = await Conversation.findById(req.params.id)
+      .populate('customerId', 'name phone email notes')
+      .populate('assignedTo', 'name');
+    const lastMessage = await Message.findOne({ conversationId: updated._id }).sort({ createdAt: -1 });
+    res.json({ ...updated.toObject(), lastMessage: lastMessage || null });
   } catch (e) { next(e); }
 });
 
@@ -110,6 +164,12 @@ router.post('/:id/messages', async (req, res, next) => {
     conversation.lastMessageAt = new Date();
     conversation.requiresHuman = false;
     conversation.status = 'OPEN';
+    conversation.handoffReason = '';
+    conversation.handoffAcknowledgedAt = null;
+    conversation.handoffResolvedAt = new Date();
+    // A human takeover invalidates any order confirmation the AI obtained before
+    // the handoff. The draft is kept for context, but payment needs a new confirm.
+    conversation.orderConfirmation = undefined;
     await conversation.save();
     await removeHuman(conversation.id);
     res.status(201).json(message);

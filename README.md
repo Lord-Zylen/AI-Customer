@@ -19,7 +19,31 @@ WhatsApp → Hermes bridge → customer-ai-gate → POST /api/hermes/webhook/gat
              → decideInbound() → allow/skip → Hermes agent → WhatsApp transport
              → customer_ai_tap → POST /api/hermes/webhook/event
 Human queue reply → POST /api/conversations/:id/messages → `hermes send --to whatsapp:<jid>`
+Order confirmed → create_payment_link tool → POST /api/hermes/webhook/payment-link → Paystack
 ```
+
+## Payments (Paystack)
+
+The agent calls the `create_payment_link` tool only after a customer explicitly confirms an order. The backend stores an `Order` with status `INITIALIZED` (pending payment), generates a unique `CAI-...` reference, initializes a Paystack transaction, and returns the checkout `payment_url`, reference, amount and currency. Repeating the request for the same chat and amount within `PAYSTACK_LINK_REUSE_MS` (default 30 minutes) returns the existing link instead of creating another transaction.
+
+Payment truth always comes from the backend:
+
+- `POST /api/payments/paystack/webhook` validates the `x-paystack-signature` HMAC (SHA-512 with `PAYSTACK_SECRET_KEY`). On `charge.success` the transaction is **re-verified** with `GET /transaction/verify/:reference` before the order becomes `PAID`; the paid amount (minor units) and currency must match the order or the order is marked `FAILED` instead.
+- Order transitions are idempotent: duplicate webhooks and concurrent processing cannot mark an order paid twice, and the customer confirmation is sent once.
+- `POST /api/hermes/webhook/payment-status` (Hermes hook secret) returns the real status and re-checks Paystack for pending orders, so the `check_payment_status` agent tool can answer "did my payment go through?" from the backend rather than trusting the customer.
+- After a verified payment the backend sends the customer a WhatsApp confirmation through the existing Hermes transport.
+
+Required variables: `PAYSTACK_SECRET_KEY` (secret key only, never exposed to the frontend or the AI prompt). Optional: `PAYSTACK_CURRENCY` (default `GHS`), `PAYSTACK_DEFAULT_EMAIL`, `PAYSTACK_CALLBACK_URL`, `PAYSTACK_LINK_REUSE_MS`, `PAYSTACK_BASE_URL`, `PAYSTACK_TIMEOUT_MS`.
+
+Configure the webhook in the Paystack dashboard (Settings → API Keys & Webhooks) as `https://<backend-url>/api/payments/paystack/webhook` and enable `charge.success` (and optionally `charge.failed`). Local testing needs a public HTTPS tunnel because Paystack cannot call `localhost`.
+
+### Testing in Paystack Test Mode
+
+1. Use a test secret key (`sk_test_...`), keep `PAYSTACK_CURRENCY=GHS`, and restart the backend.
+2. Confirm an order in WhatsApp (second, non-home number) and check `Orders` — a pending order with a Paystack link should appear. Saying "not yet"/asking questions must not create a link.
+3. Open the link and pay with a Paystack test card or test Mobile Money number. Paystack test mode never charges real money.
+4. Verify the order flips to `PAID` only after the webhook/status check, and that the WhatsApp success message arrives once (repeat the webhook to confirm no duplicate message).
+5. Add `server/test/paystack.service.test.js` coverage with `npm test --prefix server` (signature, amount/currency and minor-unit checks).
 
 ## Production Deployment (Render + Vercel)
 
@@ -53,7 +77,7 @@ Hermes remains the **only** WhatsApp transport owner. Customer AI and Hermes mus
 
 ### C. Environment variables (set in the Render dashboard — names only, values never in git)
 
-- Backend: `NODE_ENV`, `HOST` (`0.0.0.0`), `PORT` (set by Render, do not configure), `TRUST_PROXY`, `MONGODB_URI`, `REDIS_URL`, `SESSION_SECRET`, `AI_API_KEY`, `AI_MODEL`, `AI_CONFIDENCE_THRESHOLD`, `HERMES_ENABLED`, `HERMES_HOME`, `HERMES_GATEWAY_STATE`, `HERMES_BIN`, `HERMES_STATE_STALE_MS`, `WHATSAPP_AUTH_DIR`, `CAI_HOOK_SECRET`, `CAI_HOOK_BASE_URL`, `CLIENT_ORIGIN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `SEED_PRINT_CREDENTIALS`, `WHATSAPP_SETUP_TOKEN`
+- Backend: `NODE_ENV`, `HOST` (`0.0.0.0`), `PORT` (set by Render, do not configure), `TRUST_PROXY`, `MONGODB_URI`, `REDIS_URL`, `SESSION_SECRET`, `AI_API_KEY`, `AI_MODEL`, `AI_CONFIDENCE_THRESHOLD`, `PAYSTACK_SECRET_KEY`, `PAYSTACK_CURRENCY`, `PAYSTACK_DEFAULT_EMAIL`, `PAYSTACK_CALLBACK_URL`, `HERMES_ENABLED`, `HERMES_HOME`, `HERMES_GATEWAY_STATE`, `HERMES_BIN`, `HERMES_STATE_STALE_MS`, `WHATSAPP_AUTH_DIR`, `CAI_HOOK_SECRET`, `CAI_HOOK_BASE_URL`, `CLIENT_ORIGIN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `SEED_PRINT_CREDENTIALS`, `WHATSAPP_SETUP_TOKEN`
 - Hermes (same container): `GROQ_API_KEY`, `WHATSAPP_ENABLED`, `WHATSAPP_ALLOW_ALL_USERS`, `WHATSAPP_ALLOWED_USERS`, `WHATSAPP_HOME_CHANNEL`
 
 `CAI_HOOK_BASE_URL` is optional: the container entrypoint derives `http://127.0.0.1:<PORT>` from Render's dynamic `PORT` when unset. See `.env.example` for the commented template.
@@ -69,7 +93,7 @@ Hermes pairing runs from the container shell (Render exposes a shell in the serv
 ### F. Health / secrets / logs
 
 - Health: `GET /api/health` (`/api/health` on Render). DB-backed: returns `200` only when MongoDB is reachable; independent of WhatsApp connection state. Configure the Render health check to this path.
-- Secrets: `MONGODB_URI`, `REDIS_URL`, `SESSION_SECRET`, `AI_API_KEY`, `GROQ_API_KEY`, `CAI_HOOK_SECRET`, `WHATSAPP_SETUP_TOKEN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD` in Render only. `CAI_HOOK_SECRET` must be identical for backend and Hermes (same container environment).
+- Secrets: `MONGODB_URI`, `REDIS_URL`, `SESSION_SECRET`, `AI_API_KEY`, `GROQ_API_KEY`, `CAI_HOOK_SECRET`, `PAYSTACK_SECRET_KEY`, `WHATSAPP_SETUP_TOKEN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD` in Render only. `CAI_HOOK_SECRET` must be identical for backend and Hermes (same container environment).
 - CORS: set `CLIENT_ORIGIN=https://<vercel-domain>` (comma-separated for more). No-Origin requests (internal webhooks) keep working.
 - Logs: prefixed `[supervisor]`, `[backend]`, `[hermes]` lines; connection strings are redacted in error logs; message contents are never logged.
 - Fail-fast: if the persistent disk can't be mounted at `/app/data` or MongoDB is unreachable at boot, the supervisor exits non-zero so Render restarts and the logs state the cause.
@@ -110,7 +134,7 @@ Deploy the **repository root** to Blitz Cloud with **Dockerfile** build (root `D
 
 Set these in the **Blitz Cloud** application environment (names only — set real values in Blitz, never in git):
 
-- Backend: `NODE_ENV`, `HOST`, `PORT`, `TRUST_PROXY`, `MONGODB_URI`, `SESSION_SECRET`, `AI_API_KEY`, `AI_MODEL`, `AI_CONFIDENCE_THRESHOLD`, `HERMES_ENABLED`, `HERMES_HOME`, `HERMES_GATEWAY_STATE`, `HERMES_BIN`, `HERMES_STATE_STALE_MS`, `CAI_HOOK_SECRET`, `CAI_HOOK_BASE_URL`, `CLIENT_ORIGIN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `SEED_PRINT_CREDENTIALS`, `WHATSAPP_SETUP_TOKEN`
+- Backend: `NODE_ENV`, `HOST`, `PORT`, `TRUST_PROXY`, `MONGODB_URI`, `SESSION_SECRET`, `AI_API_KEY`, `AI_MODEL`, `AI_CONFIDENCE_THRESHOLD`, `PAYSTACK_SECRET_KEY`, `PAYSTACK_CURRENCY`, `PAYSTACK_DEFAULT_EMAIL`, `PAYSTACK_CALLBACK_URL`, `HERMES_ENABLED`, `HERMES_HOME`, `HERMES_GATEWAY_STATE`, `HERMES_BIN`, `HERMES_STATE_STALE_MS`, `CAI_HOOK_SECRET`, `CAI_HOOK_BASE_URL`, `CLIENT_ORIGIN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `SEED_PRINT_CREDENTIALS`, `WHATSAPP_SETUP_TOKEN`
 - Hermes (same container): `GROQ_API_KEY`, `WHATSAPP_ENABLED`, `WHATSAPP_ALLOW_ALL_USERS`, `WHATSAPP_ALLOWED_USERS`, `WHATSAPP_HOME_CHANNEL`
 
 See `.env.example` for a commented template.
@@ -151,7 +175,7 @@ Set `CLIENT_ORIGIN=https://<vercel-domain>` (comma-separated list if more than o
 
 ### J. Secrets
 
-Configure these in Blitz and never commit them: `MONGODB_URI`, `SESSION_SECRET`, `AI_API_KEY`, `CAI_HOOK_SECRET`, `GROQ_API_KEY`, `WHATSAPP_SETUP_TOKEN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`. CAI_HOOK_SECRET must be identical for the backend and Hermes (same container environment).
+Configure these in Blitz and never commit them: `MONGODB_URI`, `SESSION_SECRET`, `AI_API_KEY`, `CAI_HOOK_SECRET`, `GROQ_API_KEY`, `PAYSTACK_SECRET_KEY`, `WHATSAPP_SETUP_TOKEN`, `ADMIN_EMAIL`, `ADMIN_PASSWORD`. CAI_HOOK_SECRET must be identical for the backend and Hermes (same container environment).
 
 ### K. Health check
 

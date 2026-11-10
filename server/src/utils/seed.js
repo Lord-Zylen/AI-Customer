@@ -54,20 +54,21 @@ if (adminEmail && adminPassword) {
 // Fixture/demo data only in non-production.
 if (!isProduction) {
   await BusinessSettings.create({
-    businessName: 'Aseda Foods',
-    description: 'A fictional Ghanaian staple-food supplier.',
-    location: 'Madina, Accra',
-    openingHours: 'Mon–Sat, 8:00 AM–6:00 PM',
-    productsServices: 'Maize, rice, beans and cooking oil.',
-    prices: '50kg maize bag: GH₵250. Premium rice 5kg: GH₵118.',
-    deliveryInformation: 'Delivery is available in Accra. A team member confirms the fee before delivery.',
-    paymentInformation: 'Payment details are confirmed by a team member.',
-    commonQuestions: 'Ask a human when product availability or delivery fees are not listed.',
+    businessName: 'Check Check City',
+    description: 'Small fast-food shop in Ghana owned by Kofi. Customers place their orders over WhatsApp. All prices are in Ghanaian cedis (GH₵) and every item is sold per pack.',
+    location: 'Not confirmed yet — refer customers to Kofi (the owner).',
+    openingHours: 'Not confirmed yet — refer customers to Kofi (the owner).',
+    productsServices: 'Our menu has exactly three items, each sold per pack:\n1. Jollof Rice\n2. Fried Rice\n3. Noodles\nThese three items are the only food items we have confirmed information about.',
+    prices: 'Jollof Rice — GH₵30 per pack\nFried Rice — GH₵30 per pack\nNoodles — GH₵30 per pack\nEvery pack of any item on the menu costs GH₵30. An order total is GH₵30 multiplied by the number of packs (for example: 2 packs of Jollof Rice + 1 pack of Noodles = GH₵60 + GH₵30 = GH₵90). No other prices, fees, or discounts are confirmed.',
+    deliveryInformation: 'Not confirmed — we have no confirmed delivery details. Refer the customer to Kofi (the owner) or a human representative.',
+    paymentInformation: 'Not confirmed — we have no confirmed payment details. Refer the customer to Kofi (the owner) or a human representative.',
+    commonQuestions: 'Q: What food do you sell / What is on your menu?\nA: We currently have Jollof Rice, Fried Rice and Noodles — GH₵30 per pack each.\n\nQ: How much is a pack / How much is your jollof / How much is fried rice?\nA: Every pack costs GH₵30, whichever item the customer picks.\n\nQ: Do you sell drinks, pizza, burgers or other food that is not on the menu?\nA: We do not have confirmed information about anything that is not on the menu above, so we cannot confirm that it is available. A human representative (Kofi, the owner) will follow up.\n\nQ: Do you deliver? What is the delivery fee?\nA: Delivery and delivery fees are not confirmed. A human representative (Kofi, the owner) will assist.\n\nQ: Is [item] in stock right now?\nA: We do not have a reliable availability system, so we cannot confirm stock. A human representative will assist.\n\nQ: How do I pay / what payment methods do you accept?\nA: Payment method is not confirmed. A human representative (Kofi, the owner) will assist.',
+    responseStyle: 'Reply in a friendly, warm and professional way, like the owner talking to a customer. If the customer only greets you, greet them briefly and ask how you can help; do not list the menu unless they ask what you sell or ask for the menu. When the customer asks for the menu, answer from the confirmed menu information only and show each item with its price clearly on its own line. Use one fitting emoji per menu item: 🍚 Jollof Rice, 🍛 Fried Rice, 🍜 Noodles. Keep replies short. When the customer says what they want to order or asks for a total, show the order itemised (each item with the quantity and its price), then the total, then ask whether they would like to proceed with the order. Never invent items, prices, delivery or payment details.',
   });
 
   const data = [
     ['John Mensah', '233201112233', 'I want a refund for my order.', 'HUMAN_REQUIRED', false, true],
-    ['Ama Boateng', '233241234567', 'How much is the 50kg maize bag?', 'OPEN', true, false],
+    ['Ama Boateng', '233241234567', 'How much is a pack of jollof rice?', 'OPEN', true, false],
     ['Kwame Owusu', '233551234567', 'Hello, do you deliver to Tema?', 'OPEN', true, false],
     ['Esi Addo', '233271234567', 'I have a complaint about my delivery.', 'HUMAN_REQUIRED', false, true],
   ];

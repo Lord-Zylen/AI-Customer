@@ -1,6 +1,6 @@
 name: customer-ai-gate
 version: 0.1.0
-description: "Customer AI integration. Gates every inbound WhatsApp message through the Customer AI decision webhook (allow/skip): approved messages are admitted into the Hermes agent for a single automatic reply; skipped messages stay silent for the human queue. Also injects the approved business knowledge (from Customer AI) into the agent prompt so automatic replies never invent prices, stock, delivery fees, refunds, or policies."
+description: "Customer AI integration. Gates every inbound WhatsApp message through the Customer AI decision webhook (allow/skip): approved messages are admitted into the Hermes agent for a single automatic reply; skipped messages stay silent for the human queue. Also injects the approved business knowledge (from Customer AI) into the agent prompt, refreshed every turn so a corrected menu can never be masked by a frozen session prompt or stale cache. Automatic replies never invent prices, stock, delivery fees, refunds, or policies. Provides save_order_draft/create_payment_link so a confirmed order produces a Paystack payment link and the backend deterministically sends the exact link to the customer's WhatsApp chat through Hermes; check_payment_status answers payment questions from verified backend state; check_order_status answers order questions from chat-scoped backend records."
 author: Customer AI
 kind: standalone
 platforms:
@@ -8,8 +8,10 @@ platforms:
   - darwin
 hooks:
   - pre_gateway_dispatch
+  - pre_llm_call
 provides_hooks:
   - pre_gateway_dispatch
+  - pre_llm_call
 tags:
   - customer-service
   - whatsapp

@@ -94,17 +94,51 @@ export async function resetWhatsAppSession() {
   throw Object.assign(new Error('WhatsApp is managed by the Hermes gateway; reset its session from Hermes.'), { status: 409 });
 }
 
-export async function sendWhatsAppMessage(to, text) {
+/**
+ * Send through the Hermes-owned WhatsApp connection. `hermes send` reuses the
+ * gateway's existing platform credentials/session, so Customer AI never opens a
+ * second WhatsApp connection.
+ *
+ * Returns `{ status: 'SENT' | 'QUEUED', messageId }`:
+ *   - SENT   the CLI reported success AND a real platform message id.
+ *   - QUEUED the CLI accepted the send but reported no message id; delivery is
+ *            not confirmed.
+ * Anything else is thrown as a delivery failure. Only the caller's delivery
+ * tracker may record success, and a missing id is never invented.
+ *
+ * Verified against the installed Hermes Agent v0.21.3 source: `hermes send
+ * --json` emits the `send_message_tool` result, and the WhatsApp bridge send
+ * path returns `{ success: true, messageId, messageIds }`. A successful bridge
+ * response can legitimately omit `messageId`, so that case is QUEUED rather
+ * than SENT.
+ */
+export async function sendWhatsAppMessage(to, text, { exec = execFile } = {}) {
   if (!to) throw Object.assign(new Error('A WhatsApp destination is required.'), { status: 400 });
   const jid = to.includes('@') ? to : `${to.replace(/\D/g, '')}@s.whatsapp.net`;
-  await new Promise((resolve, reject) => {
-    execFile(HERMES_BIN, ['send', '--to', `whatsapp:${jid}`, text], { timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+  const payload = await new Promise((resolve, reject) => {
+    exec(HERMES_BIN, ['send', '--to', `whatsapp:${jid}`, '--json', '--', text], { timeout: 30000, encoding: 'utf8', maxBuffer: 1024 * 1024 }, (err, stdout, stderr) => {
+      let result = {};
+      try { result = JSON.parse(stdout || '{}'); } catch { /* non-JSON output */ }
       if (err) {
-        const detail = (stderr || stdout || '').trim();
-        reject(Object.assign(new Error(`Hermes send failed: ${detail || err.message}`), { status: 502 }));
+        const detail = result?.error || (stderr || stdout || '').trim() || err.message;
+        reject(Object.assign(new Error(`Hermes send failed: ${detail}`), { status: 502, providerResult: result }));
         return;
       }
-      resolve();
+      if (result?.error) {
+        reject(Object.assign(new Error(`Hermes send failed: ${result.error}`), { status: 502, providerResult: result }));
+        return;
+      }
+      if (result?.skipped) {
+        reject(Object.assign(new Error(`Hermes skipped the message: ${result.reason || result.note || 'unknown reason'}`), { status: 502, providerResult: result }));
+        return;
+      }
+      if (result?.success !== true) {
+        reject(Object.assign(new Error('Hermes did not confirm the WhatsApp send.'), { status: 502, providerResult: result }));
+        return;
+      }
+      resolve(result);
     });
   });
+  const messageId = String(payload?.message_id ?? '').trim();
+  return { status: messageId ? 'SENT' : 'QUEUED', messageId };
 }

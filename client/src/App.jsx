@@ -6,6 +6,7 @@ import Conversations from './pages/Conversations';
 import Customers from './pages/Customers';
 import Dashboard from './pages/Dashboard';
 import HumanQueue from './pages/HumanQueue';
+import Landing from './pages/Landing';
 import Login from './pages/Login';
 import Orders from './pages/Orders';
 import Settings from './pages/Settings';
@@ -35,7 +36,7 @@ export default function App() {
         <Route path="/system-status" element={<Navigate to="/ai-agent" replace />} />
         <Route path="/whatsapp-setup" element={<Navigate to="/whatsapp" replace />} />
       </Route>
-      <Route path="/" element={<Navigate to="/dashboard" replace />} />
+      <Route path="/" element={<Landing />} />
       <Route path="*" element={<Navigate to="/dashboard" replace />} />
     </Routes>
   );

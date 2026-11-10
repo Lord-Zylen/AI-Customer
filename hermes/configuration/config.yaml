@@ -89,18 +89,30 @@ display:
   busy_input_mode: interrupt
   bell_on_complete: false
   bell_on_prompt: false
-  show_reasoning: true
+  show_reasoning: false
+  show_commentary: false
   platforms:
     whatsapp:
       show_reasoning: false
+      streaming: false
+      interim_assistant_messages: false
+      tool_progress: off
+      cleanup_progress: true
+      long_running_notifications: false
+      busy_ack_detail: false
+      busy_steer_ack_enabled: false
+      thinking_progress: false
   background_process_notifications: concise
-  streaming: true
+  streaming: false
   skin: default
-  interim_assistant_messages: true
-  tool_progress: all
-  cleanup_progress: false
-  long_running_notifications: true
-  busy_ack_detail: true
+  interim_assistant_messages: false
+  tool_progress: off
+  cleanup_progress: true
+  long_running_notifications: false
+  busy_ack_detail: false
+  busy_ack_enabled: false
+  busy_steer_ack_enabled: false
+  thinking_progress: false
 stt:
   enabled: true
   language: en
