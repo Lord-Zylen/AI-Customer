@@ -4,7 +4,7 @@ Customer AI is a WhatsApp customer service workspace. Hermes triages messages, r
 
 ## Run locally
 
-1. Copy `.env.example` to `.env` and set secrets and `MONGODB_URI`.
+1. Copy `.env.example` to `.env` and set secrets and `MONGODB_URI`. The template targets the GCE production layout; for local development also set `PORT=5000` and `CAI_HOOK_BASE_URL=http://127.0.0.1:5000`.
 2. Run `npm run install:all`.
 3. Run `npm run dev` and open `http://localhost:5173`.
 
@@ -45,9 +45,42 @@ Configure the webhook in the Paystack dashboard (Settings → API Keys & Webhook
 4. Verify the order flips to `PAID` only after the webhook/status check, and that the WhatsApp success message arrives once (repeat the webhook to confirm no duplicate message).
 5. Add `server/test/paystack.service.test.js` coverage with `npm test --prefix server` (signature, amount/currency and minor-unit checks).
 
-## Production Deployment (Render + Vercel)
+## Production Deployment (Google Compute Engine)
 
-The **primary** deployment target is Render (+ Vercel for the frontend). The frontend is served by Vercel; a single Render Docker web service runs the Node backend **plus** the Hermes gateway **plus** the WhatsApp bridge. MongoDB stays on Atlas; Redis stays on Redis Cloud — no datastore is installed in the container.
+The **current** deployment target is the Google Compute Engine VM
+`customer-ai-server` (`europe-west1-b`, Ubuntu 24.04, user `wisest569`). The Node
+backend runs on `127.0.0.1:9119`; Nginx terminates HTTP(S) and proxies the whole
+site (API + built frontend) to it. Hermes runs as a separate systemd service on
+the same VM and remains the only WhatsApp transport owner. MongoDB stays on
+Atlas; Redis is optional.
+
+The complete, copy-paste runbook — OS packages, Hermes install, plugin/hook
+seeding, `.env`, frontend build, systemd, Nginx/TLS, WhatsApp pairing and Paystack
+webhook setup — is in **[`deploy/gce/README.md`](deploy/gce/README.md)**.
+
+```
+Browser ──HTTPS──> Nginx :443 ──> 127.0.0.1:9119 (Customer AI + client/dist)
+                                        │
+                                        ├── MongoDB Atlas (external)
+                                        └── 127.0.0.1:9119 webhooks
+                                                 ▲
+                                        Hermes gateway
+                                                 │
+                                             WhatsApp
+```
+
+Use the repository-root `.env` for both services. It is loaded by the Node
+backend and referenced by both systemd units, so `CAI_HOOK_SECRET` and
+`GROQ_API_KEY` are automatically identical. Do not expose port `9119` in the GCP
+firewall; only `80` and `443` are public.
+
+## Legacy: Render + Vercel deployment (superseded)
+
+The Render + Vercel layout below is retained for reference only. It is no longer
+the primary target. The frontend was served by Vercel; a single Render Docker web
+service ran the Node backend **plus** the Hermes gateway **plus** the WhatsApp
+bridge. MongoDB stayed on Atlas; Redis stayed on Redis Cloud — no datastore was
+installed in the container.
 
 ### A. Architecture
 
@@ -100,7 +133,7 @@ Hermes pairing runs from the container shell (Render exposes a shell in the serv
 
 ## Legacy: Blitz Cloud deployment (superseded)
 
-Blitz Cloud was the earlier deployment target. The sections below document that layout and its assumptions; the current target is **Render + Vercel** (see above). Keep the two methods separate.
+Blitz Cloud was the earlier deployment target. The sections below document that layout and its assumptions; the current target is **Google Compute Engine** (see above). Keep the two methods separate.
 
 ### A. Architecture
 
@@ -205,4 +238,9 @@ The Dockerfile uses standard Docker primitives — `EXPOSE 8080`, `HEALTHCHECK` 
 
 ## Legacy VPS deployment (optional)
 
-The repository also contains a traditional single-VPS deployment (systemd + Nginx) under `deploy/systemd/` and `deploy/nginx/`. **These are VPS-only and are NOT used by Blitz Cloud.** Keep the two deployment methods separate: if you use Blitz, ignore `deploy/systemd` and `deploy/nginx`. The `docker-compose.yml` (bundled local Mongo + Baileys-era auth volume) is also legacy and not part of the Blitz layout.
+The current single-VM deployment assets live in `deploy/gce/` (see the Google
+Compute Engine section above). The older generic VPS templates under
+`deploy/systemd/` and `deploy/nginx/` are retained for reference but still
+assume port `5000` and an `/opt/customer-ai` checkout; do not use them for the
+GCE VM without adapting the paths and port. The `docker-compose.yml` (bundled
+local Mongo + Baileys-era auth volume) is also legacy.

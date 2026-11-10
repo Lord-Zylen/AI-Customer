@@ -1,0 +1,43 @@
+# Customer AI Node backend — Google Compute Engine (Ubuntu, systemd + Nginx).
+# Install to /etc/systemd/system/customer-ai.service.
+#
+# The backend loads the same repository-root .env as the Hermes gateway.
+# Nginx proxies the public site to 127.0.0.1:9119; port 9119 is never exposed
+# in the GCP firewall.
+[Unit]
+Description=Customer AI API (Node backend)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wisest569
+Group=wisest569
+WorkingDirectory=/home/wisest569/AI-Customer/server
+EnvironmentFile=/home/wisest569/AI-Customer/.env
+
+# Keep the backend and Hermes pointed at the same persistent Hermes home.
+# These override empty/commented values in .env and must match the gateway unit.
+Environment="HERMES_HOME=/home/wisest569/.hermes"
+Environment="HERMES_GATEWAY_STATE=/home/wisest569/.hermes/gateway_state.json"
+Environment="HERMES_BIN=/home/wisest569/.local/bin/hermes"
+Environment="CAI_HOOK_BASE_URL=http://127.0.0.1:9119"
+
+# If `command -v node` is not /usr/bin/node (for example nvm), replace this with
+# the absolute path reported by that command.
+ExecStart=/usr/bin/node src/server.js
+
+Restart=always
+RestartSec=5
+TimeoutStopSec=20
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=false
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
