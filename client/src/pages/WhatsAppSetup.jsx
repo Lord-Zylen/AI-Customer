@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react';
 import { Badge, ErrorState, PageHeading, Panel, StatusPill } from '../components/UI';
 import { formatDateTime } from '../lib/format';
 
-const rawApi = import.meta.env.VITE_API_URL || '/api';
+const rawApi = (import.meta.env.VITE_API_URL || '/api').trim().replace(/\/+$/, '');
 
 const steps = [
   ['1', 'Hermes owns the WhatsApp account', 'Customer AI never pairs a second device, so there is a single transport and no duplicate replies.'],

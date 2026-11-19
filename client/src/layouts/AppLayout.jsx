@@ -30,7 +30,7 @@ const routeMeta = {
   '/conversations': ['Conversations', 'WhatsApp threads with AI assistance'],
   '/human-queue': ['Human queue', 'Review escalated conversations'],
   '/customers': ['Customers', 'Everyone recorded in your book'],
-  '/orders': ['Orders', 'No order tracking connected yet'],
+  '/orders': ['Orders', 'Confirmed orders and Paystack payment links'],
   '/analytics': ['Analytics', 'Real numbers, no placeholders'],
   '/ai-agent': ['AI Agent', 'Automation status and activity'],
   '/whatsapp': ['WhatsApp', 'Supervised through the Hermes gateway'],

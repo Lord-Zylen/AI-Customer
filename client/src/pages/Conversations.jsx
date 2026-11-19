@@ -1,4 +1,4 @@
-import { AlertCircle, Bot, CheckCheck, MessageCircle, MoreHorizontal, Paperclip, Pause, Phone, Play, Send, UserRoundCheck, XCircle } from 'lucide-react';
+import { AlertCircle, ArrowDown, Bot, CheckCheck, MessageCircle, MoreHorizontal, Paperclip, Pause, Phone, Play, Send, UserRoundCheck, XCircle } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { Avatar, Badge, Button, EmptyState, ErrorState, IconButton, SearchBar, Spinner } from '../components/UI';
@@ -24,16 +24,26 @@ export default function Conversations() {
   const [notes, setNotes] = useState('');
   const [savingNotes, setSavingNotes] = useState(false);
   const [sending, setSending] = useState(false);
-  const listEndRef = useRef(null);
+  const [showJump, setShowJump] = useState(false);
+  const messagesRef = useRef(null);
+  const nearBottomRef = useRef(true);
+  const initialScrollRef = useRef(null);
 
   const shown = items.filter(c => !query || `${c.customerId?.name || ''} ${c.customerId?.phone || ''}`.toLowerCase().includes(query.toLowerCase()));
 
   const open = async conversation => {
+    const isSwitch = conversation._id !== active?._id;
     setActive(conversation);
     setNotes(conversation.customerId?.notes || '');
+    if (isSwitch) {
+      nearBottomRef.current = true;
+      setShowJump(false);
+    }
     if (conversation._id !== id) navigate(`/conversations/${conversation._id}`, { replace: true });
     try {
-      setMessages(await api(`/conversations/${conversation._id}/messages`));
+      const nextMessages = await api(`/conversations/${conversation._id}/messages`);
+      if (isSwitch) initialScrollRef.current = conversation._id;
+      setMessages(nextMessages);
     } catch (e) { setNotice(e.message); }
   };
 
@@ -61,8 +71,35 @@ export default function Conversations() {
     return () => clearInterval(t);
   }, []);
 
-  const scrollToBottom = () => { listEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' }); };
-  useEffect(scrollToBottom, [messages, active?._id]);
+  const scrollToLatest = (behavior = 'smooth') => {
+    const node = messagesRef.current;
+    if (!node) return;
+    node.scrollTo({ top: node.scrollHeight, behavior });
+    nearBottomRef.current = true;
+    setShowJump(false);
+  };
+
+  const handleMessagesScroll = () => {
+    const node = messagesRef.current;
+    if (!node) return;
+    const atBottom = node.scrollHeight - node.scrollTop - node.clientHeight <= 32;
+    nearBottomRef.current = atBottom;
+    setShowJump(!atBottom);
+  };
+
+  useEffect(() => {
+    if (!messagesRef.current) return;
+    if (!(initialScrollRef.current === active?._id || nearBottomRef.current)) return;
+    initialScrollRef.current = null;
+    const frame = requestAnimationFrame(() => {
+      const node = messagesRef.current;
+      if (!node) return;
+      node.scrollTop = node.scrollHeight;
+      nearBottomRef.current = true;
+      setShowJump(false);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [messages, active?._id]);
 
   const send = async () => {
     if (!text.trim() || !active || sending) return;
@@ -147,18 +184,18 @@ export default function Conversations() {
               </div>
             </div>
 
-            <div className={`triage ${active.aiEnabled ? 'triage-on' : 'triage-off'}`}>
+            <div className={`triage ${active.aiEnabled && !active.requiresHuman ? 'triage-on' : 'triage-off'}`}>
               <Bot size={17} />
               <div>
-                <b>{active.aiEnabled ? 'AI is active' : 'AI is paused'}</b>
-                <p>{active.aiEnabled ? 'Hermes can reply only to safe, high-confidence requests.' : 'Incoming messages are routed to the human queue.'}</p>
+                <b>{active.requiresHuman ? 'Human handling active' : active.aiEnabled ? 'AI is active' : 'AI is paused'}</b>
+                <p>{active.requiresHuman ? 'AI replies are stopped so they cannot conflict with a human reply. Return to AI only when you are finished.' : active.aiEnabled ? 'Hermes can reply only to safe, high-confidence requests.' : 'Incoming messages are routed to the human queue.'}</p>
               </div>
-              <Button variant="outline" size="sm" className="button-compact" onClick={() => patchConversation({ aiEnabled: !active.aiEnabled })}>
-                {active.aiEnabled ? <><Pause size={14} /> Pause AI</> : <><Play size={14} /> Resume AI</>}
+              <Button variant="outline" size="sm" className="button-compact" onClick={() => patchConversation({ aiEnabled: !(active.aiEnabled && !active.requiresHuman) })}>
+                {active.requiresHuman ? <><Play size={14} /> Return to AI</> : active.aiEnabled ? <><Pause size={14} /> Pause AI</> : <><Play size={14} /> Resume AI</>}
               </Button>
             </div>
 
-            <div className="messages">
+            <div className="messages" ref={messagesRef} onScroll={handleMessagesScroll}>
               {messages.map(m => (
                 <div key={m._id} className={`message ${m.direction === 'INBOUND' ? 'incoming' : 'outgoing'} msg-${m.senderType.toLowerCase()}`}>
                   <span className="message-sender">
@@ -175,8 +212,13 @@ export default function Conversations() {
                 </div>
               ))}
               {messages.length === 0 && <div className="messages-empty">No messages in this conversation yet.</div>}
-              <div ref={listEndRef} />
             </div>
+
+            {showJump && (
+              <Button variant="outline" size="sm" className="jump-latest" onClick={() => scrollToLatest()}>
+                <ArrowDown size={14} /> Jump to latest
+              </Button>
+            )}
 
             <div className="composer">
               <IconButton label="Attach file (not implemented)"><Paperclip size={18} /></IconButton>
@@ -227,6 +269,9 @@ export default function Conversations() {
                   </>
                 ) : (
                   <p className="profile-muted">No AI decision recorded yet.</p>
+                )}
+                {active.requiresHuman && (
+                  <p className="profile-muted">Handoff reason: {active.handoffReason || 'HUMAN_REQUIRED'}</p>
                 )}
               </div>
 

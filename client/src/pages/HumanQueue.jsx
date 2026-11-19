@@ -5,9 +5,25 @@ import { Avatar, Badge, Button, EmptyState, PageHeading } from '../components/UI
 import { api } from '../services/api';
 import { timeAgo } from '../lib/format';
 
-const highIntents = ['REFUND', 'PAYMENT_DISPUTE', 'COMPLAINT', 'LARGE_ORDER', 'DISCOUNT_REQUEST'];
-const priority = intent => (highIntents.includes(intent) ? 'danger' : 'neutral');
-const priorityLabel = intent => (highIntents.includes(intent) ? 'High priority' : 'Normal');
+const highIntents = ['REFUND', 'PAYMENT_DISPUTE', 'COMPLAINT', 'LARGE_ORDER', 'DISCOUNT_REQUEST', 'PAYMENT_VERIFICATION_FAILED', 'AI_FAILURE'];
+const reasonLabels = {
+  REFUND: 'Customer asked for a refund.',
+  PAYMENT_DISPUTE: 'Customer has a payment dispute.',
+  COMPLAINT: 'Customer raised a complaint.',
+  LARGE_ORDER: 'Customer requested a large order.',
+  DISCOUNT_REQUEST: 'Customer asked for a discount.',
+  HUMAN_REQUEST: 'Customer asked for a human.',
+  UNKNOWN: 'Message could not be understood safely.',
+  LOW_CONFIDENCE: 'AI confidence is below the policy threshold.',
+  PAYMENT_VERIFICATION_FAILED: 'Payment could not be verified with Paystack.',
+  AI_FAILURE: 'AI processing failed.',
+  MANUAL: 'Manually handed to a human.',
+  HUMAN_REQUIRED: 'Conversation is waiting for a human.',
+};
+const reasonFor = conversation => conversation.handoffReason || conversation.lastMessage?.aiIntent || 'HUMAN_REQUIRED';
+const priority = reason => (highIntents.includes(reason) ? 'danger' : 'neutral');
+const priorityLabel = reason => (highIntents.includes(reason) ? 'High priority' : 'Normal');
+const reasonLabel = reason => reasonLabels[reason] || 'Sensitive request or policy escalation.';
 
 export default function HumanQueue() {
   const [items, setItems] = useState([]);
@@ -48,7 +64,7 @@ export default function HumanQueue() {
     } catch (e) { setAssignError(e.message); } finally { setBusyId(null); }
   };
 
-  const highCount = items.filter(c => priority(c.lastMessage?.aiIntent) === 'danger').length;
+  const highCount = items.filter(c => priority(reasonFor(c)) === 'danger').length;
 
   return (
     <>
@@ -81,15 +97,15 @@ export default function HumanQueue() {
               <div className="queue-main">
                 <div className="queue-title">
                   <h3>{c.customerId?.name || 'Customer'}</h3>
-                  <Badge tone={priority(c.lastMessage?.aiIntent)}>{priorityLabel(c.lastMessage?.aiIntent)}</Badge>
+                  <Badge tone={priority(reasonFor(c))}>{priorityLabel(reasonFor(c))}</Badge>
                   <span className="queue-wait"><Clock3 size={13} /> waiting {timeAgo(c.lastMessageAt || c.updatedAt)}</span>
                 </div>
                 <p className="queue-phone">{c.customerId?.phone} · WhatsApp</p>
                 <blockquote>“{c.lastMessage?.content || 'No message text.'}”</blockquote>
-                <div className="reason"><ShieldAlert size={16} /><span><b>Why Hermes escalated:</b> Sensitive request or AI confidence below policy threshold.</span></div>
+                <div className="reason"><ShieldAlert size={16} /><span><b>Why Hermes escalated:</b> {reasonLabel(reasonFor(c))}</span></div>
               </div>
               <div className="queue-actions">
-                <Badge tone="purple">{c.lastMessage?.aiIntent || c.status}</Badge>
+                <Badge tone="purple">{reasonFor(c)}</Badge>
                 <span className="assigned-note">
                   {c.assignedTo?.name ? <><UserRoundCheck size={15} /> Assigned to {c.assignedTo.name}</> : 'Unassigned'}
                 </span>

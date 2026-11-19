@@ -95,7 +95,7 @@ export default function Analytics() {
         </Panel>
       </div>
 
-      <p className="analytics-note"><UserRoundCheck size={13} /> Counts are computed from the conversations currently served by the API (up to the latest 100). Orders analytics will appear once order tracking is connected.</p>
+      <p className="analytics-note"><UserRoundCheck size={13} /> Counts are computed from the conversations currently served by the API (up to the latest 100). Order revenue analytics are not included yet.</p>
     </>
   );
 }

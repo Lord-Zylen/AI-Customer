@@ -6,10 +6,12 @@ import Conversations from './pages/Conversations';
 import Customers from './pages/Customers';
 import Dashboard from './pages/Dashboard';
 import HumanQueue from './pages/HumanQueue';
+import Landing from './pages/Landing';
 import Login from './pages/Login';
 import Orders from './pages/Orders';
 import Settings from './pages/Settings';
 import WhatsAppSetup from './pages/WhatsAppSetup';
+import WebChat from './pages/WebChat';
 
 const Protected = ({ children }) =>
   sessionStorage.getItem('customer_ai_token') ? children : <Navigate to="/login" replace />;
@@ -35,8 +37,9 @@ export default function App() {
         <Route path="/system-status" element={<Navigate to="/ai-agent" replace />} />
         <Route path="/whatsapp-setup" element={<Navigate to="/whatsapp" replace />} />
       </Route>
-      <Route path="/" element={<Navigate to="/dashboard" replace />} />
-      <Route path="*" element={<Navigate to="/dashboard" replace />} />
+      <Route path="/" element={<Landing />} />
+      <Route path="/chat" element={<WebChat />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
 }
